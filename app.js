@@ -168,7 +168,7 @@
     const comp = due.length ? Math.round(due.filter(w => w.status === 'completed').length / due.length * 100) + ' %' : '–';
     const pending = sortedRuns().find(r => !r.feeling);
     const rec = R.recovery(S.runs);
-    return `<h1>Inicio</h1>
+    return `<div class="row between"><h1>Inicio</h1><button class="link" data-act="tab" data-k="set" aria-label="Ajustes">⚙️ Ajustes</button></div>
     ${closed ? closedCard(closed) : ''}
     ${maintain
       ? `<div class="card row between"><div><h3>Modo mantenimiento</h3><div class="sub">Sin carrera fijada: semanas variadas con una más suave cada cuatro. El plan se renueva solo.</div></div><button data-act="goals-open">Objetivos</button></div>`
@@ -194,7 +194,7 @@
     const st = S.strava;
     if (!st.worker) return '<div class="sub">Sin configurar. En Ajustes puedes conectar Strava (hace falta la guía de la carpeta). Mientras tanto, puedes añadir carreras a mano en Progreso.</div><div class="btns"><button data-act="tab" data-k="set">Ir a Ajustes</button></div>';
     if (!st.tokens) return '<div class="sub">Falta autorizar tu cuenta de Strava.</div><div class="btns"><button class="primary" data-act="strava-connect">Conectar Strava</button></div>';
-    return `<div class="sub">${esc(ui.stravaMsg || 'Conectado.')}${st.lastSync ? ' Última sincronización: ' + new Date(st.lastSync).toLocaleString('es-ES') : ''}</div><div class="btns"><button class="primary" data-act="strava-sync" ${ui.busy ? 'disabled' : ''}>${ui.busy ? 'Sincronizando…' : 'Sincronizar ahora'}</button></div>`;
+    return `<div class="sub">${esc(ui.stravaMsg || 'Conectado.')}${st.lastSync ? ' Última sincronización: ' + new Date(st.lastSync).toLocaleString('es-ES') : ''}</div><div class="btns"><button class="primary" data-act="strava-sync" ${ui.busy ? 'disabled' : ''}>${ui.busy ? 'Sincronizando…' : 'Sincronizar ahora'}</button><button data-act="tab" data-k="set">Ajustes de Strava</button></div>`;
   }
 
   /* ---- Calendario ---- */
