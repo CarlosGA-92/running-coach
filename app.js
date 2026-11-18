@@ -1,4 +1,4 @@
-/* Running Coach AI (web) — interfaz. Todo se guarda en localStorage de tu iPhone. */
+/* Running Coach AI (web): local cache plus optional multi-device cloud synchronization. */
 (function () {
   'use strict';
   const R = window.RCA;
@@ -45,6 +45,7 @@
   function save() {
     S.savedAt = new Date().toISOString();
     try { localStorage.setItem(KEY, JSON.stringify(S)); } catch (e) { storageOk = false; }
+    if (window.RCACloud && window.RCACloud.onLocalSave) window.RCACloud.onLocalSave();
   }
   const snap = () => ({ workouts: S.workouts, extras: S.extras, unavailable: S.unavailable, profile: S.profile, goal: S.goal, runs: S.runs });
 
@@ -475,6 +476,7 @@
     $('#app').innerHTML = (views[ui.tab] || vHome)() + tabbar();
     $('#modal-root').innerHTML = ui.modal ? vModal() : '';
     if (ui.tab === 'coach') { const c = $('#chatEnd'); if (c) c.scrollIntoView({ block: 'end' }); }
+    if (window.RCACloud && window.RCACloud.renderPanel) window.RCACloud.renderPanel();
   }
   function tabbar() {
     const t = [['home', '🏠', 'Inicio'], ['cal', '📅', 'Calendario'], ['train', '🏃', 'Entrenar'], ['prog', '📈', 'Progreso'], ['coach', '💬', 'Coach']];
@@ -951,7 +953,8 @@
     <div class="card"><h2>IA generativa</h2>
       <div class="sub">Se activa con un binding <b>AI</b> de Cloudflare Workers y la variable <b>ALLOWED_STRAVA_ATHLETE_ID</b> en tu Worker. Si no está configurada, el coach sigue funcionando por reglas.</div>
       <div class="sub small" style="margin-top:8px">La IA recibe un resumen de las últimas carreras, sensaciones, objetivos y sesiones próximas; no recibe tus tokens, datos GPS ni datos de Strava sin resumir. Las recomendaciones nunca se aplican automáticamente.</div></div>
-    <div class="card"><h2>Tus datos</h2><div class="sub small">Se guardan solo en este navegador. Haz copia de vez en cuando: si borras datos del sitio o desinstalas la app, se pierden.</div>
+    <div id="cloud-panel"></div>
+    <div class="card"><h2>Tus datos</h2><div class="sub small">Los datos se guardan localmente. Si activas la sincronizacion, perfil, calendario e historial tambien se guardan en Cloudflare D1 (no se guardan los tokens de Strava).</div>
       <div class="btns"><button data-act="export">Exportar copia</button><button data-act="import">Importar copia</button><button class="danger" data-act="reset">Borrar todo</button></div><input type="file" id="file" accept="application/json" hidden></div>`;
   }
 
@@ -1348,7 +1351,7 @@
       a.href = URL.createObjectURL(blob); a.download = 'running-coach-' + R.today() + '.json'; a.click(); setTimeout(() => URL.revokeObjectURL(a.href), 4000);
     },
     import: () => { $('#file').click(); },
-    reset: () => { if (confirm('Se borrarán perfil, plan y carreras de este dispositivo. ¿Seguro?')) { S = freshState(); save(); ui.modal = null; } },
+    reset: () => { if (window.RCACloud?.isLinked?.()) { toast('Primero desvincula este dispositivo de la nube para evitar borrar datos compartidos.'); return; } if (confirm('Se borrarán perfil, plan y carreras de este dispositivo. ¿Seguro?')) { S = freshState(); save(); ui.modal = null; } },
     overlay: () => {},
   };
   document.addEventListener('click', e => {
@@ -1363,6 +1366,7 @@
   document.addEventListener('change', e => {
     const el = e.target;
     if (el.id === 'file') {
+      if (window.RCACloud?.isLinked?.()) { toast('Desvincula la nube antes de importar una copia completa.'); return; }
       const f = el.files[0]; if (!f) return;
       f.text().then(t => { try { const o = JSON.parse(t); if (o.v !== 1) throw 0; S = ensureShape(o); reconcileExistingRuns(); applyFitness(); lifecycle(); save(); toast('Copia importada'); } catch (x) { toast('Archivo no válido'); } render(); }); return;
     }
@@ -1408,7 +1412,35 @@
   render();
   if ('serviceWorker' in navigator && location.protocol.startsWith('http')) navigator.serviceWorker.register('sw.js').catch(() => {});
   // Automático al abrir y al regresar a primer plano; no es sincronización en segundo plano.
-  setTimeout(maybeAutoSync, 450);
-  document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') maybeAutoSync(); });
-  window.__rca = { get S() { return S; }, ui, render, R };   // para pruebas
+  setTimeout(() => {
+    const ready = window.RCACloud?.ready;
+    if (ready) ready.then(() => maybeAutoSync(), () => maybeAutoSync());
+    else maybeAutoSync();
+  }, 900);
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState !== 'visible') return;
+    if (window.RCACloud) window.RCACloud.pull().then(() => maybeAutoSync());
+    else maybeAutoSync();
+  });
+  window.__rca = {
+    get S() { return S; }, ui, render, R,
+    workerBase,
+    ensureStravaToken,
+    getSharedState() {
+      const keys = ['v','profile','goal','goals','weights','workouts','extras','unavailable','runs','notes','weeklyDecisions','intervals'];
+      const result = {};
+      for (const k of keys) result[k] = JSON.parse(JSON.stringify(S[k] == null ? null : S[k]));
+      return result;
+    },
+    installSharedState(data) {
+      if (!data || data.v !== 1 || !Array.isArray(data.runs) || !Array.isArray(data.workouts) ||
+          !data.profile || !data.goal || !Array.isArray(data.goals)) throw new Error('Estado de nube invalido.');
+      const localAuth = S.strava;
+      const localChat = S.chat;
+      const newData = JSON.parse(JSON.stringify(data));
+      delete newData.strava; delete newData.cloud;
+      S = ensureShape({ ...newData, strava: localAuth, chat: localChat });
+      save(); render();
+    }
+  };
 })();
