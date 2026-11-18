@@ -1,16 +1,16 @@
-RUNNING COACH - Calendario inteligente
+Running Coach V6 - valoracion post-entrenamiento y adaptacion semanal
 
-Sube los 3 archivos app.js, index.html y sw.js al repositorio de GitHub, sustituyendo los anteriores.
-Deja core.js y los demas archivos sin modificar.
+1. Antes de actualizar: Ajustes > Tus datos > Exportar copia.
+2. Sube los archivos app.js, index.html y sw.js a GitHub (raiz de running-coach), sustituyendo los anteriores.
+3. Comprueba que GitHub Pages publica la nueva version y abre la URL en Safari.
+4. Sincroniza una carrera reciente o abre una anterior desde Progreso.
 
-Cambios:
-- Las carreras reales sustituyen visualmente a las sesiones previstas.
-- Se enlaza cada carrera con un entrenamiento de la misma semana (prioridad: mismo dia, luego siguiente).
-- Cada carrera muestra la comparativa con el plan original.
-- Si el resto de la semana tiene descanso insuficiente, se mueve o retira una sesion automatica.
-- Si una carrera supera significativamente la duracion planificada, se reduce una futura sesion automatica.
-- Incluye diagnostico de errores de Strava de la actualizacion anterior.
-- Se actualizan tambien carreras ya guardadas al abrir la app.
+Novedades:
+- Valoracion provisional tras la importacion: duracion, comparativa y analisis SIN inventar intensidad.
+- Con sensaciones (esfuerzo, respiracion, fatiga, molestias), la valoracion se concreta.
+- Resumen en Inicio de la ultima salida.
+- Informe al abrir carrera: valoracion, planificado vs realizado y adaptacion de la semana.
+- Al sincronizar una salida de los ultimos 14 dias, se abre automaticamente su informe.
+- Mantiene la logica de calendario inteligente de V5 y el diagnostico de errores de Strava.
 
-Precaucion: en Ajustes > Tus datos > Exportar copia, haz una copia antes de sustituir.
-Al publicarse, abre Safari con https://carlosga-92.github.io/running-coach/ y reabre la app instalada.
+No subas worker.js ni claves/tokens a GitHub. No borres los datos guardados del iPhone.

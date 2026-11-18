@@ -251,6 +251,92 @@
       <div class="row between"><span>Ritmo medio</span><span>${R.fmtPace(p.paceSec)} → <b>${R.fmtPace(R.avgPace(run))}</b></span></div>
       <div class="sub small" style="margin-top:8px">El ritmo previsto es orientativo: incluye calentamiento y recuperación. Se conserva el plan original para compararlo, pero el calendario muestra solo la carrera real.</div></div>`;
   }
+
+  /* Informe post-entreno: datos observables separados de las sensaciones declaradas.
+     Nunca inferimos el esfuerzo solo a partir de una velocidad o la FC media. */
+  function runReview(run) {
+    const f = run.feeling, planned = run.planned;
+    let title = 'Valoración inicial', quality = 'Para valorar el esfuerzo y ajustar el plan a tus sensaciones, completa el cuestionario de abajo.';
+    if (f) {
+      if ((f.pain || '').trim()) {
+        title = 'Revisar molestias';
+        quality = 'Has registrado molestias. Prioriza la recuperación y evita forzar si persisten o aumentan.';
+      } else if (f.rpe >= 8 || f.breathing >= 4 || f.fatigue >= 4) {
+        title = 'Sesión exigente';
+        quality = `Según tus sensaciones, fue una salida exigente (esfuerzo ${f.rpe}/10). Conviene vigilar la recuperación.`;
+      } else if (f.rpe <= 5 && f.breathing <= 2 && f.fatigue <= 2 && f.canContinue) {
+        title = 'Sesión cómoda';
+        quality = `Te has sentido cómodo y con margen para continuar (esfuerzo ${f.rpe}/10). Esto ayuda a valorar tu progresión.`;
+      } else {
+        title = 'Esfuerzo moderado';
+        quality = `Has registrado un esfuerzo ${f.rpe}/10. Mantener la regularidad y la recuperación importa más que acelerar cada salida.`;
+      }
+    }
+    let planText = 'Carrera libre: no había una sesión del plan disponible para vincular durante esa semana.';
+    if (planned && planned.durationS > 0) {
+      const pct = Math.round((run.durationS / planned.durationS - 1) * 100);
+      if (Math.abs(pct) < 10) planText = 'Has realizado una duración parecida a la prevista (diferencia menor del 10 %).';
+      else if (pct > 0) planText = `Has corrido un ${pct} % más de tiempo que el previsto; eso supone más duración, pero no demuestra por sí solo que fuese más intenso.`;
+      else planText = `Has corrido un ${Math.abs(pct)} % menos de tiempo que el previsto; no se considera un incumplimiento: el entrenamiento real sustituye al plan.`;
+    }
+    // Tendencia solo frente a salidas anteriores de distancia parecida.
+    // Una diferencia de ritmo no equivale a una diferencia de esfuerzo.
+    const prev = S.runs.filter(x => x.id !== run.id && x.start < run.start &&
+      x.distanceM > 0 && run.distanceM > 0 &&
+      x.distanceM / run.distanceM >= 0.8 && x.distanceM / run.distanceM <= 1.2)
+      .sort((a,b) => b.start.localeCompare(a.start)).slice(0,3);
+    let trend = 'Aún no hay suficientes salidas anteriores de distancia similar para valorar la evolución del ritmo.';
+    if (prev.length >= 2) {
+      const ordered = prev.map(R.avgPace).filter(x => Number.isFinite(x) && x > 0).sort((a,b) => a-b);
+      if (ordered.length >= 2) {
+        const median = ordered[Math.floor(ordered.length / 2)], diff = Math.round(R.avgPace(run) - median);
+        trend = Math.abs(diff) < 10
+          ? 'Ritmo parecido al de tus últimas salidas de distancia similar.'
+          : `Ritmo ${Math.abs(diff)} s/km ${diff < 0 ? 'más rápido' : 'más lento'} que la referencia de tus últimas salidas de distancia similar. El terreno, la intención y el esfuerzo pueden explicar parte de la diferencia.`;
+      }
+    }
+    return { title, quality, planText, trend, needsFeedback: !f };
+  }
+  function weekAdaptation(run) {
+    const lines = [];
+    if (run.planned) {
+      lines.push(run.planned.date === run.date
+        ? 'La sesión prevista para este día se ha sustituido por tu entrenamiento real.'
+        : `Tu salida del ${R.longDate(run.date)} cuenta como la sesión prevista para ${R.longDate(run.planned.date)}.`);
+    } else lines.push('La salida se registra como carrera libre, sin consumir una sesión planificada.');
+    const seen = new Set();
+    for (const c of (run.autoChanges || [])) {
+      if (seen.has(c.id)) continue;
+      seen.add(c.id);
+      const w = wkById(c.id);
+      if (!w) continue;
+      const before = c.before;
+      if (w.status === 'discarded' && before.status !== 'discarded')
+        lines.push(`Se ha retirado «${w.title}» para evitar acumular sesiones muy próximas.`);
+      else if (w.date !== before.date)
+        lines.push(`«${w.title}» se ha movido del ${R.longDate(before.date)} al ${R.longDate(w.date)} para dejar más recuperación.`);
+      if (w.status === 'planned' && Math.abs(R.totalMin(w.items) - R.totalMin(before.items)) > 0.01)
+        lines.push(`Se ha suavizado «${w.title}» porque la salida real fue más larga de lo previsto.`);
+    }
+    if (!(run.autoChanges || []).length && !run.coachAdviceApplied) {
+      lines.push(run.planned ? 'Se mantienen los demás entrenamientos: las reglas automáticas no detectaron cambios necesarios.'
+        : 'El resto del plan no se ha modificado.');
+    }
+    if (run.coachAdviceApplied)
+      lines.push(`Además, has aceptado la propuesta del coach para «${run.coachAdviceApplied.title}».`);
+    lines.push('Este ajuste es orientativo y no sustituye tus sensaciones ni una valoración profesional ante molestias.');
+    return lines;
+  }
+  function postRunReport(run) {
+    const review = runReview(run), changes = weekAdaptation(run);
+    return `<div class="card"><h2>Valoración del entrenamiento</h2><h3>${esc(review.title)}</h3>
+      <div class="sub" style="margin-top:5px">${esc(review.quality)}</div>
+      <div class="note">${esc(review.planText)}</div>
+      <div class="sub">${esc(review.trend)}</div>
+      ${review.needsFeedback ? '<div class="sub small">Valoración provisional: faltan tus sensaciones para interpretar el esfuerzo real.</div>' : ''}</div>
+      <div class="card"><h2>Cómo he adaptado tu semana</h2>
+      ${changes.map(t => `<div class="sub" style="margin:5px 0">${esc(t)}</div>`).join('')}</div>`;
+  }
   const wkById = id => S.workouts.find(w => w.id === id);
   const runById = id => S.runs.find(r => r.id === id);
   const sortedRuns = () => S.runs.slice().sort((a, b) => Date.parse(b.start) - Date.parse(a.start));
@@ -297,6 +383,7 @@
       (w.date <= t || (w.status === 'completed' && w.completedOn && w.completedOn <= t)));
     const comp = due.length ? Math.round(due.filter(w => w.status === 'completed').length / due.length * 100) + ' %' : '–';
     const pending = sortedRuns().find(r => !r.feeling);
+    const latest = sortedRuns()[0];
     const rec = R.recovery(S.runs);
     return `<div class="row between"><h1>Inicio</h1><button class="link" data-act="tab" data-k="set" aria-label="Ajustes">⚙️ Ajustes</button></div>
     ${closed ? closedCard(closed) : ''}
@@ -309,7 +396,8 @@
       ? `<div data-act="wk-open" data-id="${next.id}" style="cursor:pointer"><h3>${esc(next.title)}</h3><div class="sub">${R.longDate(next.date)}</div><p style="margin:6px 0">${esc(next.objective)}</p><div class="sub">${wkSummary(next)}</div></div>`
       : '<div class="sub">No hay sesiones pendientes.</div>'}</div>
     <div class="card"><h2>Recuperación estimada</h2><h3>${rec.level}</h3><div class="sub">${esc(rec.detail)}</div></div>
-    ${pending ? `<div class="card" data-act="run-open" data-id="${pending.id}" style="cursor:pointer"><b>¿Cómo te sentiste en tu última carrera?</b><div class="sub">${runLine(pending)} · ${pending.date}</div></div>` : ''}
+    ${latest ? `<div class="card" data-act="run-open" data-id="${latest.id}" style="cursor:pointer"><h2>Última carrera · Informe del coach</h2><h3>${esc(runReview(latest).title)}</h3><div class="sub">${runLine(latest)}</div><div class="sub" style="margin-top:6px">${esc(runReview(latest).planText)}</div><div class="btns"><button class="primary" data-act="run-open" data-id="${latest.id}">${latest.feeling ? 'Ver valoración y adaptación' : 'Ver informe y valorar sensaciones'}</button></div></div>` : ''}
+    ${pending && latest && pending.id !== latest.id ? `<div class="card" data-act="run-open" data-id="${pending.id}" style="cursor:pointer"><b>Tienes una carrera pendiente de valorar</b><div class="sub">${runLine(pending)} · ${pending.date}</div></div>` : ''}
     <div class="card"><h2>Esta semana</h2><div class="stats"><div><b>${R.fmtKm(wr.reduce((s, r) => s + r.distanceM / 1000, 0))}</b><span>km</span></div><div><b>${Math.round(wr.reduce((s, r) => s + r.durationS / 60, 0))}</b><span>min</span></div><div><b>${wr.length}</b><span>sesiones</span></div><div><b>${comp}</b><span>cumplimiento</span></div></div></div>
     <div class="card"><h2>Strava</h2>${stravaCard()}</div>
     ${storageOk ? '' : '<div class="note bad">No puedo guardar datos en este navegador (¿modo privado?). Lo que hagas se perderá al cerrar.</div>'}`;
@@ -555,6 +643,7 @@
         <div><b>${r.avgHR ? Math.round(r.avgHR) : '–'}</b><span>FC media</span></div><div><b>${r.maxHR ? Math.round(r.maxHR) : '–'}</b><span>FC máx.</span></div><div><b>${r.cadence || '–'}</b><span>pasos/min</span></div></div>
         <div class="sub small" style="margin-top:6px">Desnivel +: ${r.elevation != null ? Math.round(r.elevation) + ' m' : '–'}</div></div>
       ${runPlanComparison(r)}
+      ${postRunReport(r)}
       <div class="card"><h2>Parciales por km</h2>${sp.length ? barChart(sp.map(s => ({ l: s.km, y: s.paceSec / 60 })), v => v.toFixed(1)) + sp.map(s => `<div class="row between small"><span>km ${s.km}${s.partial ? ' (parcial)' : ''}</span><span>${R.fmtPace(s.paceSec)} min/km${s.hr ? ' · ' + Math.round(s.hr) + ' lpm' : ''}</span></div>`).join('') : `<div class="sub">${r.stravaId ? 'Aún no cargados.' : 'No disponibles en carreras manuales.'}</div>${r.stravaId && S.strava.tokens ? `<div class="btns"><button data-act="load-splits" data-id="${r.id}">Cargar parciales</button></div>` : ''}`}</div>
       <div class="card"><h2>Sensaciones</h2>
         <label>Esfuerzo percibido: <b id="rpeV">${f.rpe}</b>/10</label><input type="range" min="1" max="10" id="fRpe" value="${f.rpe}" oninput="document.getElementById('rpeV').textContent=this.value">
@@ -676,6 +765,14 @@
       });
       S.strava.lastSync = new Date().toISOString();
       ui.stravaMsg = (imported.length ? `${imported.length} carrera(s) nueva(s) importada(s).` : 'Sin carreras nuevas.') + (newExtras.length ? ` ${newExtras.length} otra(s) actividad(es) añadida(s).` : '');
+      if (imported.length) {
+        const newest = imported[0];
+        // Solo abrimos el informe automáticamente para una salida reciente; al importar
+        // el histórico completo no interrumpimos con informes de entrenos antiguos.
+        if (newest.date >= R.addDays(R.today(), -14) && newest.date <= R.today()) {
+          ui.tab = 'home'; ui.modal = { type: 'run', id: newest.id };
+        }
+      }
       save();
     } catch (e) { ui.stravaMsg = 'Error: ' + e.message; }
     ui.busy = false; render();
@@ -758,7 +855,7 @@
       const a = R.evaluate(r, [...hist, r], S.profile);
       r.evaluation = a.summary; r.adviceFactor = a.factor; r.adviceRecovery = a.recovery; r.adviceHandled = false; save();
     },
-    'advice-apply': d => { const r = runById(d.id), w = nextPlannedAfter(r.date); if (w) applyAdvice(w, r.adviceFactor, r.adviceRecovery, r.evaluation); r.adviceHandled = true; save(); if (w) toast('Aplicado a «' + w.title + '»'); },
+    'advice-apply': d => { const r = runById(d.id), w = nextPlannedAfter(r.date); if (w) { applyAdvice(w, r.adviceFactor, r.adviceRecovery, r.evaluation); r.coachAdviceApplied = { workoutId: w.id, title: w.title }; } r.adviceHandled = true; save(); if (w) toast('Aplicado a «' + w.title + '»'); },
     'advice-no': d => { runById(d.id).adviceHandled = true; save(); },
     'run-del': d => { if (!confirm('¿Borrar esta carrera?')) return; const r = runById(d.id); if (r) restoreRunPlan(r); S.runs = S.runs.filter(x => x.id !== d.id); ui.modal = null; save(); },
     'load-splits': async d => {
