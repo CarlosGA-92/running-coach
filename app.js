@@ -470,7 +470,29 @@
     }
     const r = await fetch(workerBase() + '/api' + path, { headers: { Authorization: 'Bearer ' + st.tokens.access_token } });
     if (r.status === 429) throw new Error('Strava limita las peticiones (100 cada 15 min). Prueba más tarde.');
-    if (!r.ok) throw new Error('Strava respondió ' + r.status + '.');
+    if (!r.ok) {
+      // Diagnóstico: mostrar la respuesta de Strava sin exponer los tokens.
+      // No incluye Authorization ni las claves de la API.
+      let detalle = '';
+      try {
+        const raw = await r.text();
+        let obj = null;
+        try { obj = JSON.parse(raw); } catch (_) { /* respuesta no JSON */ }
+        if (obj && typeof obj === 'object') {
+          const message = typeof obj.message === 'string' ? obj.message :
+            typeof obj.error === 'string' ? obj.error : '';
+          const causes = Array.isArray(obj.errors) ? obj.errors.slice(0, 3)
+            .map(x => [x.resource, x.field, x.code].filter(Boolean).join('/')).join(', ') : '';
+          detalle = [message, causes].filter(Boolean).join(' · ');
+        } else if (/^\s*</.test(raw)) {
+          detalle = 'El servidor devolvió HTML en lugar de JSON';
+        } else {
+          detalle = raw.replace(/[\r\n]+/g, ' ').slice(0, 130);
+        }
+      } catch (_) { /* diagnóstico no disponible */ }
+      const ruta = path.split('?')[0]; // solo ruta, nunca parámetros ni credenciales
+      throw new Error(`HTTP ${r.status} consultando ${ruta}${detalle ? ' · ' + detalle.slice(0, 170) : ''}`);
+    }
     return r.json();
   }
   async function stravaSync() {
