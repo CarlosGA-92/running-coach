@@ -12,7 +12,7 @@
   /* ---------------- Estado ---------------- */
   function freshState() {
     const s = { v: 1, profile: R.defaultProfile(), goal: R.defaultGoal(), goals: [], weights: [], workouts: [], extras: [], unavailable: [], runs: [], chat: [], notes: [],
-      strava: { worker: '', tokens: null, lastSync: null, lastAutoAttempt: null }, weeklyDecisions: {}, savedAt: null };
+      strava: { worker: '', tokens: null, lastSync: null, lastAutoAttempt: null }, weeklyDecisions: {}, intervals: { sent: {} }, savedAt: null };
     s.goals = [s.goal];
     const plan = R.generatePlan(s.profile, s.goal, new Set(), nowObj());
     s.workouts = plan.workouts; s.extras = plan.extras; s.notes = plan.notes;
@@ -23,6 +23,8 @@
     s.goals = Array.isArray(s.goals) ? s.goals : [];
     s.weights = Array.isArray(s.weights) ? s.weights : [];
     s.weeklyDecisions = s.weeklyDecisions && typeof s.weeklyDecisions === 'object' ? s.weeklyDecisions : {};
+    s.intervals = s.intervals && typeof s.intervals === 'object' ? s.intervals : { sent: {} };
+    s.intervals.sent = s.intervals.sent && typeof s.intervals.sent === 'object' ? s.intervals.sent : {};
     s.strava = Object.assign({ worker: '', tokens: null, lastSync: null, lastAutoAttempt: null }, s.strava || {});
     s.profile.lastReplan = s.profile.lastReplan || null;
     s.profile.fitnessSource = s.profile.fitnessSource || null;
@@ -47,7 +49,7 @@
   const snap = () => ({ workouts: S.workouts, extras: S.extras, unavailable: S.unavailable, profile: S.profile, goal: S.goal, runs: S.runs });
 
   const ui = { tab: 'home', calMode: 'week', calAnchor: R.today(), calSel: R.today(), period: 30, filter: 'all', modal: null,
-    create: { text: '', kind: 'rodajeSuave', date: R.today(), preview: null }, busy: false, aiBusy: false, stravaMsg: '', pseg: 'runs', cmpA: '', cmpB: '' };
+    create: { text: '', kind: 'rodajeSuave', date: R.today(), preview: null }, busy: false, aiBusy: false, intervalsBusy: false, stravaMsg: '', pseg: 'runs', cmpA: '', cmpB: '' };
 
   function toast(msg) { const t = $('#toast'); t.textContent = msg; t.classList.add('on'); clearTimeout(toast._t); toast._t = setTimeout(() => t.classList.remove('on'), 3200); }
 
@@ -138,6 +140,104 @@
   const nextPlannedAfter = date => S.workouts.filter(w => w.status === 'planned' && w.date > date && w.kind !== 'carreraObjetivo').sort(byDate)[0];
   /* La carrera REAL es la referencia. La sesión planeada se conserva solo como
      comparación, pero no vuelve a mostrarse como pendiente/completada en el calendario. */
+  /* V7.3: expectativa de la sesion. RPE es un RANGO ORIENTATIVO por tipo de
+     actividad, no una prediccion individual ni una constatacion de capacidad. */
+  function expectedEffort(kind) {
+    return ({recuperacion:[2,4],rodajeSuave:[3,5],carreraContinua:[4,6],
+      intervalos:[5,7],prueba:[7,8],carreraObjetivo:[5,8]})[kind] || [3,6];
+  }
+  function sessionExpectation(w) {
+    if (!w) return null;
+    const minutes = Number.isFinite(w.durationS) ? w.durationS / 60 : R.totalMin(w.items || []);
+    const km = Number.isFinite(w.distanceM) ? w.distanceM / 1000 : R.distKm(w.items || []);
+    const [rpeMin, rpeMax] = expectedEffort(w.kind);
+    const purpose = ({
+      recuperacion:'Recuperar sin anadir fatiga.',
+      rodajeSuave:'Sostener una intensidad conversacional y terminar con margen.',
+      carreraContinua:'Mantener un esfuerzo estable y controlado.',
+      intervalos:'Completar los bloques intensos sin perder el control de las recuperaciones.',
+      prueba:'Medir una referencia exigente pero controlada.',
+      carreraObjetivo:'Completar el objetivo con una salida controlada.'
+    })[w.kind] || 'Acumular entrenamiento sin sobrecarga.';
+    return { minutes:Math.round(minutes*10)/10, km:Math.round(km*100)/100,
+      rpeMin, rpeMax, purpose, kind:w.kind||'carreraContinua' };
+  }
+  function expectationNote(w) {
+    const e=sessionExpectation(w), t=R.today();
+    const recent=S.runs.filter(r=>r.date>=R.addDays(t,-41) && r.date<=t &&
+      Number.isFinite(r.durationS) && r.durationS>0);
+    if (!recent.length) return 'Sin salidas recientes comparables: valoraremos el resultado segun tus sensaciones.';
+    const longest=Math.max(...recent.map(r=>r.durationS/60));
+    const hard=recent.slice().sort((a,b)=>b.date.localeCompare(a.date))[0];
+    if (e.minutes>longest*1.15)
+      return `La duracion prevista supera tus ${Math.round(longest)} min maximos recientes en movimiento. Revisa sensaciones y reduce si hace falta.`;
+    if (hard && hard.feeling && (hard.feeling.pain || hard.feeling.rpe>=8))
+      return 'Tu ultima salida incluyo molestias o esfuerzo alto: si no has recuperado, valora suavizar o posponer la sesion.';
+    return 'Contrasta al acabar la duracion prevista y el esfuerzo percibido; no es necesario batir tu ritmo anterior.';
+  }
+  function sessionExpectationHtml(w) {
+    if (!w || w.status!=='planned') return '';
+    const e=sessionExpectation(w);
+    return `<div class="card"><h2>Antes de salir · que esperamos</h2>
+      <div class="row between"><span>Duracion orientativa</span><b>${fmtMin(e.minutes)} min</b></div>
+      <div class="row between"><span>Esfuerzo orientativo</span><b>RPE ${e.rpeMin}–${e.rpeMax}/10</b></div>
+      <div class="sub" style="margin-top:8px">${esc(e.purpose)}</div>
+      <div class="sub small" style="margin-top:6px">${esc(expectationNote(w))}</div>
+      <div class="sub small" style="margin-top:6px">RPE = esfuerzo que percibes de 1 a 10. No es una prediccion exacta ni una exigencia de ritmo.</div></div>`;
+  }
+  /* La comparacion utiliza el plan realmente vinculado, no un valor inventado
+     por la IA. Para carreras anteriores a esta version reconstruye el criterio
+     orientativo desde el tipo de sesion, y lo indica como retrospectivo. */
+  function sessionOutcome(run) {
+    if (!run.planned) return {label:'Salida libre',detail:'No hay una sesion planificada con la que comparar.',next:'Registra sensaciones para valorar la carga.',e:null};
+    const e=run.sessionExpectation || sessionExpectation(run.planned);
+    const dur=run.durationS / 60;
+    const ratio=e.minutes>0?dur/e.minutes:1;
+    const f=run.feeling;
+    let label, detail, next;
+    if (!f) {
+      label='Resultado provisional';
+      detail='La duracion ya se puede comparar; faltan sensaciones para evaluar la exigencia.';
+      next='Registra RPE, respiracion y fatiga antes de decidir si conviene progresar.';
+    } else if ((f.pain||'').trim()) {
+      label='Molestias registradas';
+      detail='Has indicado molestias: la duracion o la velocidad no compensan esa senal.';
+      next='Prioriza recuperacion y revisa el siguiente entrenamiento; consulta si persisten o empeoran.';
+    } else if (f.rpe>e.rpeMax+1 || f.breathing>=4 || f.fatigue>=4) {
+      label='Mas exigente de lo esperado';
+      detail='Tu esfuerzo o fatiga declarados superan el margen de control de esta sesion.';
+      next='Valora suavizar o mover la siguiente sesion. La app no aplicara cambios importantes sin tu aceptacion.';
+    } else if (ratio>=.85 && ratio<=1.25 && f.rpe<=e.rpeMax && f.breathing<=3 && f.fatigue<=3) {
+      label='En linea con lo esperado';
+      detail='Has acumulado un tiempo parecido al objetivo y tu esfuerzo se ha mantenido controlado.';
+      next='Mantendria de momento la siguiente sesion; la progresion exige constancia en varias salidas, no una sola.';
+    } else if (ratio>1.25) {
+      label='Mas duracion de la prevista';
+      detail='Has realizado bastante mas tiempo del plan. Eso suma carga aunque te hayas sentido comodo.';
+      next='No aumentaria mas la carga inmediatamente; revisaria la recuperacion antes de la proxima salida.';
+    } else if (ratio<.85) {
+      label='Menos duracion de la prevista';
+      detail='Has hecho una salida mas corta. No es un incumplimiento: el calendario mantiene lo realmente realizado.';
+      next='Manten o revisa la siguiente sesion segun sensaciones; no recuperes minutos por obligacion.';
+    } else {
+      label='Resultado mixto';
+      detail='La duracion y las sensaciones no permiten confirmar una mejora clara con esta unica sesion.';
+      next='Mantendria la carga y esperaria otra salida comparable antes de progresar.';
+    }
+    return {label,detail,next,e,minutesDelta:Math.round((dur-e.minutes)*10)/10,
+      retrospective:!run.sessionExpectation};
+  }
+  function outcomeHtml(run) {
+    const o=sessionOutcome(run);if(!o.e)return '';
+    return `<div class="card"><h2>Lo esperado vs. lo realizado</h2><h3>${esc(o.label)}</h3>
+      <div class="row between" style="margin-top:8px"><span>Duracion</span><b>${fmtMin(o.e.minutes)} → ${fmtMin(run.durationS/60)} min</b></div>
+      <div class="row between"><span>RPE orientativo</span><b>${o.e.rpeMin}–${o.e.rpeMax}/10</b></div>
+      <div class="row between"><span>RPE declarado</span><b>${run.feeling ? run.feeling.rpe+'/10' : 'Pendiente'}</b></div>
+      <div class="sub" style="margin-top:8px">${esc(o.detail)}</div>
+      <div class="note">Proxima decision: ${esc(o.next)}</div>
+      ${o.retrospective?'<div class="sub small">Criterio orientativo reconstruido a partir del plan guardado; no fue una prevision registrada antes de esa salida.</div>':''}
+      <div class="sub small">El tiempo de Strava puede incluir caminar; esta comparativa no certifica que corrieras todo el tiempo sin pausas.</div></div>`;
+  }
   function plannedSnapshot(w) {
     const durationS = Math.round(R.totalMin(w.items) * 60);
     const distanceM = R.distKm(w.items) * 1000;
@@ -220,6 +320,7 @@
     }
     if (w) {
       run.planned ||= plannedSnapshot(w);
+      run.sessionExpectation ||= sessionExpectation(run.planned);
       run.workoutId = w.id;
       w.status = 'completed'; w.runId = run.id;
       w.completedOn = run.date;
@@ -390,6 +491,75 @@
   const runLine = r => `${R.fmtKm(r.distanceM / 1000)} km · ${R.fmtDur(r.durationS)} · ${R.fmtPace(R.avgPace(r))} min/km`;
 
 
+
+  /* ---------------- V8: Intervals.icu → Companion → Apple Watch ---------------- */
+  // Los eventos se identifican por el ID estable de sesión del coach.
+  // Cuando se modifica un bloque, el mismo external_id actualiza el evento.
+  const intervalsFingerprint = w => JSON.stringify({date:w.date,title:w.title,items:w.items});
+  const intervalsSent = w => S.intervals.sent[w.id] || null;
+  const intervalsIsCurrent = w => intervalsSent(w)?.fingerprint === intervalsFingerprint(w);
+  const intervalsObsoleteIds = () => Object.keys(S.intervals.sent).filter(id => {
+    const w = S.workouts.find(x=>x.id===id);
+    return !w || w.status === 'skipped' || w.status === 'discarded';
+  });
+  function intervalsButton(w) {
+    if (!w || w.status !== 'planned') return '';
+    const sent = intervalsSent(w), current = intervalsIsCurrent(w);
+    const label = !sent ? 'Enviar al Apple Watch' : current ? 'Reenviar al Apple Watch' : 'Actualizar en el Apple Watch';
+    return `<button class="primary" data-act="intervals-send" data-id="${esc(w.id)}" ${ui.intervalsBusy?'disabled':''}>${ui.intervalsBusy ? 'Enviando…' : label}</button>`;
+  }
+  function intervalsStatus(w) {
+    const sent=intervalsSent(w);
+    if (!sent) return '';
+    return `<div class="note ${intervalsIsCurrent(w)?'good':'warn'}">${intervalsIsCurrent(w)?
+      'Sesión enviada a Intervals.icu. Abre Companion en el iPhone para actualizar el reloj.' :
+      'Has modificado esta sesión después de enviarla. Vuelve a pulsar «Actualizar en el Apple Watch».'}</div>`;
+  }
+  async function intervalsRequest(route, body) {
+    const token=await ensureStravaToken();
+    if (!workerBase()) throw new Error('Configura primero el Worker en Ajustes.');
+    const r=await fetch(workerBase()+route,{
+      method:'POST',
+      headers:{'Content-Type':'application/json','Authorization':'Bearer '+token},
+      body:JSON.stringify(body)
+    });
+    let result;
+    try {result=await r.json();} catch(_) {throw new Error('El Worker no devolvió JSON. Comprueba que has desplegado worker.js V8.');}
+    if (!r.ok || !result.ok) throw new Error(result.error || `Error HTTP ${r.status} al conectar con Intervals.icu`);
+    return result;
+  }
+  async function intervalsSend(id) {
+    const w=wkById(id);
+    if (!w || w.status!=='planned') {toast('Solo puedes enviar sesiones pendientes.');return;}
+    if (ui.intervalsBusy) return;
+    ui.intervalsBusy=true;render();
+    try {
+      const fingerprint=intervalsFingerprint(w);
+      const result=await intervalsRequest('/intervals/workout',{
+        id:w.id,date:w.date,title:w.title,items:w.items
+      });
+      S.intervals.sent[w.id]={eventId:result.id,externalId:result.externalId,
+        fingerprint,sentAt:new Date().toISOString()};
+      save();
+      toast(result.structured?'Sesión enviada. Abre Companion en el iPhone.':'Enviada, pero comprueba los bloques en Intervals.icu.');
+      if (!result.structured) ui.modal={type:'msg',title:'Revisa los bloques en Intervals.icu',
+        body:'La API ha guardado el evento, pero no confirmó que reconociera los intervalos estructurados. Abre su calendario y comprueba que aparezcan antes de sincronizar con el reloj.'};
+    } catch(e) {
+      ui.modal={type:'msg',title:'No se pudo enviar a Intervals.icu',body:e.message};
+    }
+    ui.intervalsBusy=false;render();
+  }
+  async function intervalsRemove(ids) {
+    if (!Array.isArray(ids) || !ids.length || ui.intervalsBusy) return;
+    ui.intervalsBusy=true;render();
+    try {
+      await intervalsRequest('/intervals/delete',{ids});
+      ids.forEach(id=>delete S.intervals.sent[id]);
+      save();toast(ids.length===1?'Sesión retirada de Intervals.icu.':'Sesiones antiguas retiradas de Intervals.icu.');
+    } catch(e) {ui.modal={type:'msg',title:'No se pudo retirar',body:e.message};}
+    ui.intervalsBusy=false;render();
+  }
+
   /* ---------------- V7: lectura objetiva de la semana ---------------- */
   function weeklyDigest(start) {
     const end = R.addDays(start, 7);
@@ -477,13 +647,14 @@
       plannedMinutes: Math.round(r.planned.durationS / 60), plannedKm: +(r.planned.distanceM / 1000).toFixed(2)
     } : null;
     return {
-      contextVersion: '7.2', today,
+      contextVersion: '7.3', today,
       dataRules: [
         'Para evaluar la forma ACTUAL solo se usan carreras de los ultimos 42 dias; las anteriores se excluyen del analisis deportivo actual.',
         'El perfil se recalcula de forma automatica usando solo datos recientes y no esta condicionado por las marcas antiguas.',
         'Duracion total o moving_time NO es igual a minutos continuos sin caminar; la base del plan es una estimacion conservadora.',
         'Un ritmo mas rapido no demuestra por si solo mejor forma si cambian distancia o esfuerzo.',
-        'El coach puede recomendar ajustes, pero cualquier modificacion de sesiones desde el chat requiere accion del usuario.'
+        'El coach puede recomendar ajustes, pero cualquier modificacion de sesiones desde el chat requiere accion del usuario.',
+        'Cada sesion futura tiene una meta orientativa de RPE por tipo y duracion. Compara despues lo esperado y lo observado. RPE previsto es un rango de carga, no una prediccion de sensaciones.'
       ],
       goal: { title: S.goal.title, date: S.goal.date, distanceKm: S.goal.distanceKm,
         daysUntil: Math.max(0, R.diffDays(today, S.goal.date)) },
@@ -506,11 +677,17 @@
         minutes:+(r.durationS/60).toFixed(1), paceMinKm:R.fmtPace(R.avgPace(r)),
         reportedFeeling:r.feeling ? {rpe:r.feeling.rpe, breathing:r.feeling.breathing,
           fatigue:r.feeling.fatigue, pain:!!r.feeling.pain, couldContinue:!!r.feeling.canContinue} : null,
-        originalPlan:plannedFor(r), automaticPlanChanges:(r.autoChanges||[]).length })),
+        originalPlan:plannedFor(r), expectedVsActual:r.planned ? (()=>{const o=sessionOutcome(r);return {
+          expectedRpeRange:[o.e.rpeMin,o.e.rpeMax], expectedMinutes:o.e.minutes,
+          actualRpe:r.feeling?.rpe??null, result:o.label,
+          reconstructedFromPlan:o.retrospective};})() : null,
+        automaticPlanChanges:(r.autoChanges||[]).length })),
       upcoming: S.workouts.filter(w => w.status==='planned' && w.date >= today && w.date < R.addDays(today,14))
         .sort(byDate).slice(0,7).map(w => ({ date:w.date, title:w.title,
           minutes:Math.round(R.totalMin(w.items)), approxKm:+R.distKm(w.items).toFixed(2), type:w.kind,
-          origin:w.manual?'manual':'automatic', lastAdjustment:(w.explanation||'').slice(0,130) })),
+          origin:w.manual?'manual':'automatic', expectedRpe:expectedEffort(w.kind),
+          expectedPurpose:sessionExpectation(w).purpose,
+          lastAdjustment:(w.explanation||'').slice(0,130) })),
       forecast5K:(() => {const x=R.predictRace(5,S.runs);return x.ok?
         {time:R.fmtDur(x.mid),confidence:x.confidence,method:'Formula estimativa; no es garantia de tiempo de carrera.'}:
         {available:false,reason:x.reason};})()
@@ -543,7 +720,7 @@
       `<div class="card"><h2>Mi perfil</h2><div class="sub">Faltan salidas recientes para actualizarlo automáticamente. No tomaré las carreras del año pasado como referencia de tu forma actual.</div></div>`}
     ${S.notes && S.notes.length ? S.notes.map(n => `<div class="note warn">${esc(n)}</div>`).join('') : ''}
     <div class="card"><h2>Próximo entrenamiento</h2>${next
-      ? `<div data-act="wk-open" data-id="${next.id}" style="cursor:pointer"><h3>${esc(next.title)}</h3><div class="sub">${R.longDate(next.date)}</div><p style="margin:6px 0">${esc(next.objective)}</p><div class="sub">${wkSummary(next)}</div></div>`
+      ? `<div data-act="wk-open" data-id="${next.id}" style="cursor:pointer"><h3>${esc(next.title)}</h3><div class="sub">${R.longDate(next.date)}</div><p style="margin:6px 0">${esc(next.objective)}</p><div class="sub">${wkSummary(next)}</div></div>${sessionExpectationHtml(next)}`
       : '<div class="sub">No hay sesiones pendientes.</div>'}</div>
     <div class="card"><h2>Recuperación estimada</h2><h3>${rec.level}</h3><div class="sub">${esc(rec.detail)}</div></div>
     ${latest ? `<div class="card" data-act="run-open" data-id="${latest.id}" style="cursor:pointer"><h2>Última carrera · Informe del coach</h2><h3>${esc(runReview(latest).title)}</h3><div class="sub">${runLine(latest)}</div><div class="sub" style="margin-top:6px">${esc(runReview(latest).planText)}</div><div class="btns"><button class="primary" data-act="run-open" data-id="${latest.id}">${latest.feeling ? 'Ver valoración y adaptación' : 'Ver informe y valorar sensaciones'}</button></div></div>` : ''}
@@ -606,7 +783,7 @@
   function dayHtml(ds) {
     const t = R.today(), blocked = S.unavailable.includes(ds), d = R.parseDate(ds);
     const ws = S.workouts.filter(w => w.date === ds && (w.status === 'planned' || w.status === 'skipped' || (w.status === 'completed' && !w.runId))).map(w =>
-      `<div class="item" data-act="wk-open" data-id="${w.id}" style="cursor:pointer"><span class="dot" style="background:${w.status === 'completed' ? 'var(--good)' : w.status === 'skipped' ? 'var(--sub)' : 'var(--accent)'}"></span><div class="grow"><b>${esc(w.title)}</b><div class="sub small">${wkSummary(w)}${w.status === 'skipped' ? ' · no realizada' : ''}</div></div>›</div>`).join('');
+      `<div class="item" data-act="wk-open" data-id="${w.id}" style="cursor:pointer"><span class="dot" style="background:${w.status === 'completed' ? 'var(--good)' : w.status === 'skipped' ? 'var(--sub)' : 'var(--accent)'}"></span><div class="grow"><b>${esc(w.title)}</b><div class="sub small">${wkSummary(w)}${w.status === 'skipped' ? ' · no realizada' : ''}${intervalsSent(w) && w.status === 'planned' ? (intervalsIsCurrent(w) ? ' · Enviada a Intervals' : ' · Actualizar en Intervals') : ''}</div></div>›</div>`).join('');
     // Mostrar cada carrera real importada desde Strava o introducida a mano.
     // No se pierde ninguna carrera por no coincidir con una fecha de entrenamiento planificado.
     const rs = S.runs.filter(r => r.date === ds).sort((a, b) => (a.start || '').localeCompare(b.start || '')).map(r =>
@@ -632,7 +809,7 @@
     const c = ui.create;
     return `<h1>Entrenar</h1>
     ${w ? `<div class="card"><h2>${w.date === t ? 'Sesión de hoy' : 'Próxima sesión'}</h2><h3>${esc(w.title)}</h3><div class="sub">${R.longDate(w.date)} · ${wkSummary(w)}</div><div style="margin-top:8px">${blocksHtml(w.items)}</div>
-      ${w.notes ? `<div class="note">${esc(w.notes)}</div>` : ''}<div class="btns"><button data-act="wk-open" data-id="${w.id}">Ver / editar</button></div></div>` : '<div class="card sub">No hay sesiones pendientes.</div>'}
+      ${w.notes ? `<div class="note">${esc(w.notes)}</div>` : ''}${intervalsStatus(w)}<div class="btns"><button data-act="wk-open" data-id="${w.id}">Ver / editar</button>${intervalsButton(w)}</div></div>${sessionExpectationHtml(w)}` : '<div class="card sub">No hay sesiones pendientes.</div>'}
     <div class="card"><h2>Crear sesión escribiendo una frase</h2>
       <div class="sub small">Ejemplos: «5x2 min a 7:30 con 2 min caminando» · «10 min calentando, 20 min a 8:00, 5 min enfriando» · «6x30 s a 7:00 con 90 s caminando». El ritmo se da en min:seg o en km/h («a 9 km/h»). Sin ritmo, usa el tuyo cómodo (${R.fmtPace(S.profile.easyPace)}).</div>
       <textarea data-ui="create.text" placeholder="Escribe la sesión…">${esc(c.text)}</textarea>
@@ -642,7 +819,7 @@
       <h2 style="margin-top:14px">Plantillas (rellenan la frase)</h2>
       ${TEMPLATES.map((x, i) => `<div class="item"><button class="link grow" style="text-align:left" data-act="tpl" data-i="${i}">${esc(x[0])}</button></div>`).join('')}
     </div>
-    <div class="card"><h2>Cómo ejecutarla hoy</h2><div class="sub">Abre la app Entreno del Apple Watch («Carrera exterior») y usa los bloques como guía. Cuando Strava reciba la carrera, pulsa «Sincronizar» en Inicio. Esta versión web <b>no</b> avisa por AirPods ni controla el reloj.</div></div>`;
+    <div class="card"><h2>Cómo ejecutarla hoy</h2><div class="sub">Pulsa «Enviar al Apple Watch». Después abre Intervals.icu Companion en el iPhone: sincronizará el entrenamiento estructurado con la app Entreno del reloj. Los avisos los gestiona Apple Watch. Al terminar, Strava enviará los datos reales a Running Coach.</div></div>`;
   }
 
   /* ---- Progreso ---- */
@@ -765,6 +942,12 @@
       ${S.strava.worker && !S.strava.tokens ? `<div class="sub small" style="margin-top:8px">Recomendado: pulsa «Obtener código», autoriza en Strava, copia el código que aparece y pégalo aquí.</div><div class="btns"><button class="primary" data-act="strava-manual">Obtener código</button></div><label>Código</label><input id="stCode" placeholder="Pega aquí el código"><div class="btns"><button data-act="strava-code">Usar código</button><button data-act="strava-connect">Conectar automáticamente</button></div>` : ''}
       <div class="btns">${S.strava.worker && S.strava.tokens ? '<button data-act="strava-connect">Reautorizar</button>' : ''}${S.strava.tokens ? '<button data-act="strava-sync">Sincronizar</button><button data-act="strava-athlete-id">Ver mi ID de atleta</button><button class="danger" data-act="strava-disc">Desconectar</button>' : ''}</div>
       <div class="sub small" style="margin-top:8px">Sincronización automática al abrir o volver a la app si han pasado 15 minutos desde la última importación. Puedes sincronizar manualmente cuando quieras.</div></div>
+    <div class="card"><h2>Apple Watch · Intervals.icu</h2>
+      <div class="sub">No necesitas pegar claves aquí: INTERVALS_API_KEY e INTERVALS_ATHLETE_ID se guardan en Cloudflare. Entra en una sesión pendiente y pulsa «Enviar al Apple Watch». Después abre Companion en el iPhone.</div>
+      <div class="sub small" style="margin-top:6px">Sesiones enviadas: ${Object.keys(S.intervals.sent).length}. No se envían automáticamente los cambios del coach: cuando cambies una sesión, pulsa «Actualizar en el Apple Watch».</div>
+      ${intervalsObsoleteIds().length ? `<div class="note warn">Tienes ${intervalsObsoleteIds().length} sesiones antiguas, descartadas o eliminadas del plan que siguen en Intervals.icu.</div><div class="btns"><button class="danger" data-act="intervals-clean" ${ui.intervalsBusy?'disabled':''}>Retirar sesiones antiguas de Intervals.icu</button></div>` : ''}
+      <div class="sub small" style="margin-top:6px">Si editas el entrenamiento desde Intervals.icu, al reenviarlo desde Running Coach se sustituirán esos cambios. Solo elimina sesiones creadas por Running Coach.</div>
+    </div>
     <div class="card"><h2>IA generativa</h2>
       <div class="sub">Se activa con un binding <b>AI</b> de Cloudflare Workers y la variable <b>ALLOWED_STRAVA_ATHLETE_ID</b> en tu Worker. Si no está configurada, el coach sigue funcionando por reglas.</div>
       <div class="sub small" style="margin-top:8px">La IA recibe un resumen de las últimas carreras, sensaciones, objetivos y sesiones próximas; no recibe tus tokens, datos GPS ni datos de Strava sin resumir. Las recomendaciones nunca se aplican automáticamente.</div></div>
@@ -783,8 +966,10 @@
       const w = wkById(m.id); if (!w) return '';
       inner = top(esc(w.title)) + `<div class="card"><div class="sub">${R.KINDS[w.kind]} · ${R.longDate(w.date)}</div><div style="margin-top:4px">${wkSummary(w)}</div>${w.status !== 'planned' ? `<div class="sub" style="margin-top:4px">Estado: ${w.status === 'completed' ? 'completada' : w.status === 'skipped' ? 'no realizada' : 'descartada'}</div>` : ''}</div>
         ${w.explanation ? `<div class="note">✨ ${esc(w.explanation)}</div>` : ''}${w.objective ? `<div class="card"><h2>Objetivo</h2>${esc(w.objective)}</div>` : ''}
+        ${sessionExpectationHtml(w)}
         <div class="card"><h2>Bloques</h2>${blocksHtml(w.items)}</div>${w.notes ? `<div class="card"><h2>Indicaciones del entrenador</h2>${esc(w.notes)}</div>` : ''}
-        <div class="btns">${w.status === 'planned' ? `<button data-act="move-open" data-id="${w.id}">Mover</button><button data-act="wk-edit" data-id="${w.id}">Editar</button>` : ''}<button data-act="wk-dup" data-id="${w.id}">Duplicar</button>${w.status === 'planned' && w.kind !== 'carreraObjetivo' ? `<button class="danger" data-act="wk-skip" data-id="${w.id}">No la haré</button>` : ''}${w.runId && runById(w.runId) ? `<button data-act="run-open" data-id="${w.runId}">Ver carrera</button>` : ''}</div>`;
+        <div class="btns">${w.status === 'planned' ? `<button data-act="move-open" data-id="${w.id}">Mover</button><button data-act="wk-edit" data-id="${w.id}">Editar</button>` : ''}<button data-act="wk-dup" data-id="${w.id}">Duplicar</button>${w.status === 'planned' && w.kind !== 'carreraObjetivo' ? `<button class="danger" data-act="wk-skip" data-id="${w.id}">No la haré</button>` : ''}${w.runId && runById(w.runId) ? `<button data-act="run-open" data-id="${w.runId}">Ver carrera</button>` : ''}</div>
+        ${intervalsStatus(w)}<div class="btns">${intervalsButton(w)}${intervalsSent(w) ? `<button class="danger" data-act="intervals-remove" data-id="${esc(w.id)}" ${ui.intervalsBusy?'disabled':''}>Retirar de Intervals.icu</button>` : ''}</div>`;
     } else if (m.type === 'move') {
       const w = wkById(m.id), t = R.today();
       inner = top('Mover «' + esc(w.title) + '»') + '<div class="card">' + Array.from({ length: 21 }, (_, i) => R.addDays(t, i)).map(d => {
@@ -808,6 +993,7 @@
         <div><b>${r.avgHR ? Math.round(r.avgHR) : '–'}</b><span>FC media</span></div><div><b>${r.maxHR ? Math.round(r.maxHR) : '–'}</b><span>FC máx.</span></div><div><b>${r.cadence || '–'}</b><span>pasos/min</span></div></div>
         <div class="sub small" style="margin-top:6px">Desnivel +: ${r.elevation != null ? Math.round(r.elevation) + ' m' : '–'}</div></div>
       ${runPlanComparison(r)}
+      ${outcomeHtml(r)}
       ${postRunReport(r)}
       <div class="card"><h2>Parciales por km</h2>${sp.length ? barChart(sp.map(s => ({ l: s.km, y: s.paceSec / 60 })), v => v.toFixed(1)) + sp.map(s => `<div class="row between small"><span>km ${s.km}${s.partial ? ' (parcial)' : ''}</span><span>${R.fmtPace(s.paceSec)} min/km${s.hr ? ' · ' + Math.round(s.hr) + ' lpm' : ''}</span></div>`).join('') : `<div class="sub">${r.stravaId ? 'Aún no cargados.' : 'No disponibles en carreras manuales.'}</div>${r.stravaId && S.strava.tokens ? `<div class="btns"><button data-act="load-splits" data-id="${r.id}">Cargar parciales</button></div>` : ''}`}</div>
       <div class="card"><h2>Sensaciones</h2>
@@ -997,6 +1183,17 @@
     'cal-next': () => { ui.calAnchor = ui.calMode === 'week' ? R.addDays(ui.calAnchor, 7) : R.fmtDate(new Date(R.parseDate(ui.calAnchor).getFullYear(), R.parseDate(ui.calAnchor).getMonth() + 1, 1)); },
     'cal-sel': d => { ui.calSel = d.d; },
     'wk-open': d => openWk(d.id),
+    'intervals-send': d => intervalsSend(d.id),
+    'intervals-remove': d => {
+      if (!confirm('¿Retirar esta sesión de Intervals.icu? No borra tu plan de Running Coach.')) return;
+      return intervalsRemove([d.id]);
+    },
+    'intervals-clean': () => {
+      const ids=intervalsObsoleteIds();
+      if (!ids.length) return;
+      if (!confirm(`¿Retirar ${ids.length} sesión(es) antiguas de Intervals.icu? Solo se eliminarán las creadas por Running Coach.`)) return;
+      return intervalsRemove(ids.slice(0,30));
+    },
     'toggle-unavail': d => {
       const msgs = setUnavailable(d.d, !S.unavailable.includes(d.d));
       if (msgs.length) ui.modal = { type: 'msg', title: 'Cambios en el plan', body: msgs.join('\n\n') };
