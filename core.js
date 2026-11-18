@@ -417,22 +417,55 @@
     }
     return C.avgPace(r) <= medianPace * 1.10;
   };
-  /** Ritmo y minutos continuos a partir de tus carreras de las últimas 6 semanas. Sin datos suficientes usa el perfil. */
+  /** Perfil de entrenamiento estimado con datos RECENTES (42 dias).
+   * Independiente de los valores previos del perfil: nunca se limita a 1,5 veces
+   * un parametro antiguo ni utiliza carreras de hace meses para valorar la forma.
+   * IMPORTANTISIMO: Strava moving_time no demuestra minutos sin caminar.
+   * baseMin es una PROXY CONSERVADORA para el plan, no un record verificado.
+   */
   C.estimateFitness = (runs, profile, nowTs = Date.now()) => {
     const DAY = 86400000;
-    const recent = runs.filter(r => { const t = Date.parse(r.start); return t >= nowTs - 42 * DAY && t <= nowTs && r.distanceM >= 800 && r.durationS >= 300; })
-      .sort((a, b) => Date.parse(b.start) - Date.parse(a.start));
-    const weekly = runs.filter(r => { const t = Date.parse(r.start); return t >= nowTs - 28 * DAY && t <= nowTs; }).reduce((s, r) => s + r.durationS / 60, 0) / 4;
-    if (recent.length < 2) return { easyPace: profile.easyPace, baseMin: profile.continuousMin, weeklyMinutes: weekly, runsConsidered: recent.length, fromData: false,
-      note: `Hay pocas carreras en las últimas 6 semanas (${recent.length}); sigo usando los valores de tu perfil.` };
-    const median = med(recent.slice(0, 6).map(C.avgPace));
-    const cont = recent.filter(r => C.isMostlyContinuous(r, median));
-    const easy = cont.length ? med(cont.slice(0, 5).map(C.avgPace)) : median;
-    const longest = cont.length ? Math.max(...cont.map(r => r.durationS / 60)) : null;
-    // Cautela: nunca más de 1,5 veces la base anterior de golpe (una pausa caminando podría confundirse con carrera continua).
-    const base = Math.max(1, Math.round(Math.min(longest ?? profile.continuousMin, Math.max(profile.continuousMin, 1) * 1.5)));
-    return { easyPace: easy, baseMin: base, weeklyMinutes: weekly, runsConsidered: recent.length, fromData: true,
-      note: `Basado en ${recent.length} carreras de las últimas 6 semanas: ritmo ${C.fmtPace(easy)} min/km` + (longest != null ? ` y ${base} min como salida continua más larga.` : '.') };
+    const recent = (runs || []).filter(r => {
+      const ts = Date.parse(r.start || (r.date ? r.date + 'T12:00:00Z' : ''));
+      return Number.isFinite(ts) && ts >= nowTs - 42 * DAY && ts <= nowTs + DAY &&
+        r.distanceM >= 800 && r.durationS >= 300 && r.durationS <= 5 * 3600 &&
+        C.avgPace(r) >= 240 && C.avgPace(r) <= 1500;
+    }).sort((a, b) => Date.parse(b.start) - Date.parse(a.start));
+    const weeklyMinutes = recent.filter(r => Date.parse(r.start) >= nowTs - 28 * DAY)
+      .reduce((a, r) => a + r.durationS / 60, 0) / 4;
+    const sample = recent.slice(0, 8);
+    const longestMovingMin = sample.length ? Math.max(...sample.map(r => r.durationS / 60)) : 0;
+    if (recent.length < 2) return {
+      easyPace: profile.easyPace, baseMin: profile.continuousMin, weeklyMinutes,
+      runsConsidered: recent.length, fromData: false, longestMovingMin,
+      confidence: 'insuficiente', windowDays: 42,
+      note: `Solo ${recent.length} carrera(s) en los últimos 42 días: conservo el último perfil provisional y no uso salidas antiguas como referencia actual.`
+    };
+    const paces = sample.map(C.avgPace);
+    const easyEfforts = sample.filter(r => r.feeling &&
+      Number(r.feeling.rpe) <= 6 && Number(r.feeling.breathing) <= 3 &&
+      !(r.feeling.pain || '').trim());
+    // Con sensaciones suficientemente numerosas usamos esas salidas; si no,
+    // suavizamos el ritmo medio observado para no prescribir como facil un intervalo.
+    const paceSample = easyEfforts.length >= 2 ? easyEfforts.slice(0, 5).map(C.avgPace) : paces.slice(0, 6);
+    const easyPace = Math.round(clamp(med(paceSample) + (easyEfforts.length >= 2 ? 0 : 15), 260, 1200));
+    let baseMin = 5;
+    for (const run of sample) {
+      const splits = (run.splits || []).filter(x => !x.partial && x.paceSec > 0);
+      const uniform = splits.length >= 3 && Math.max(...splits.map(x => x.paceSec)) / Math.min(...splits.map(x => x.paceSec)) <= 1.28;
+      // Una duracion en movimiento de 40 min puede incluir caminar o pausas.
+      // Estimamos entre 70-82 % como referencia prudente; NO certifica continuidad.
+      const factor = uniform ? 0.82 : 0.70;
+      baseMin = Math.max(baseMin, Math.round(run.durationS / 60 * factor));
+    }
+    baseMin = Math.max(5, Math.min(baseMin, 60));
+    const confidence = recent.length >= 5 && easyEfforts.length >= 2 ? 'media' : 'baja';
+    return {
+      easyPace, baseMin, weeklyMinutes, runsConsidered: recent.length,
+      fromData: true, longestMovingMin, confidence, windowDays: 42,
+      latestRunDate: recent[0].date,
+      note: `Perfil calculado con ${recent.length} carreras de los últimos 42 días: ritmo cómodo orientativo ${C.fmtPace(easyPace)} min/km y base de resistencia estimada ${baseMin} min. Salida más larga: ${Math.round(longestMovingMin)} min en movimiento. No se puede verificar que todo ese tiempo fuera sin caminar.`
+    };
   };
 
   /** Previsión con fórmula de Riegel. No inventa: si faltan datos devuelve {ok:false, reason}. */

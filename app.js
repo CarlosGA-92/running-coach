@@ -25,6 +25,7 @@
     s.weeklyDecisions = s.weeklyDecisions && typeof s.weeklyDecisions === 'object' ? s.weeklyDecisions : {};
     s.strava = Object.assign({ worker: '', tokens: null, lastSync: null, lastAutoAttempt: null }, s.strava || {});
     s.profile.lastReplan = s.profile.lastReplan || null;
+    s.profile.fitnessSource = s.profile.fitnessSource || null;
     const base = { id: 'g1', kind: 'finish', status: 'active', targetTimeSec: null, resultSec: null, achievedRunId: null };
     const cur = Object.assign({}, base, s.goal || R.defaultGoal());
     const inList = s.goals.find(g => g.id === cur.id);
@@ -61,10 +62,25 @@
     S.extras.push(...plan.extras); S.notes = plan.notes; save();
     return plan.notes;
   }
-  /** Pasa al perfil tu forma real si hay datos suficientes (ritmo y minutos seguidos). */
-  function applyFitness() { const f = fitNow(); if (f.fromData) { S.profile.easyPace = Math.round(f.easyPace); S.profile.continuousMin = f.baseMin; } save(); }
-  /* ---- Ciclo de vida de objetivos ---- */
+  /* El PERFIL se actualiza automaticamente con los ultimos 42 dias.
+     La IA lo interpreta, pero el calculo numerico depende de datos medidos,
+     no de un texto inventado por el modelo. El plan se cambia por separado. */
   const fitNow = () => R.estimateFitness(S.runs, S.profile);
+  function applyFitness() {
+    const f = fitNow(), p = S.profile;
+    const source = { fromData: f.fromData, runs: f.runsConsidered,
+      windowDays: 42, confidence: f.confidence, latestRunDate: f.latestRunDate || null,
+      longestMovingMin: Math.round(f.longestMovingMin || 0),
+      estimatedContinuous: true };
+    if (f.fromData) {
+      p.easyPace = Math.round(f.easyPace);
+      p.continuousMin = f.baseMin; // proxy para plan; NO una continuidad demostrada
+    }
+    p.fitnessSource = source;
+    save();
+    return f;
+  }
+  /* ---- Ciclo de vida de objetivos ---- */
   function maintainGoal() { return { id: R.uid(), title: 'Mantener y mejorar la forma', kind: 'maintain', distanceKm: 0, date: R.MAINTAIN_DATE, targetTimeSec: null, status: 'active', resultSec: null, achievedRunId: null }; }
   function activateGoal(g) {
     S.goals.forEach(x => { if (x.status === 'active') x.status = 'replaced'; });
@@ -451,14 +467,53 @@
     }).filter(Boolean).slice(-20);
   }
   function coachDataContext() {
-    const today = R.today(), p = S.profile;
+    const today = R.today(), p = S.profile, f = fitNow();
+    const all = sortedRuns().filter(r => r.date && r.distanceM > 0 && r.durationS > 0);
+    const currentRuns = all.filter(r => r.date >= R.addDays(today, -41) && r.date <= today);
+    const longestTotal = currentRuns.reduce((best, r) => !best || r.durationS > best.durationS ? r : best, null);
+    const latest = currentRuns.length ? currentRuns[0] : null;
+    const plannedFor = r => r.planned ? {
+      originalDate: r.planned.date, title: r.planned.title,
+      plannedMinutes: Math.round(r.planned.durationS / 60), plannedKm: +(r.planned.distanceM / 1000).toFixed(2)
+    } : null;
     return {
-      date: today, goal: { title: S.goal.title, date: S.goal.date, distanceKm: S.goal.distanceKm },
-      runner: { easyPaceMinKm: R.fmtPace(p.easyPace), continuousMin: p.continuousMin, weeklySessions: p.weeklySessions },
-      weeks: [weeklyDigest(R.mondayOf(today)), weeklyDigest(R.addDays(R.mondayOf(today), -7))].map(w => ({week:w.start, km:+w.km.toFixed(2), runs:w.sessions, minutes:Math.round(w.min), avgRpe: w.avgRpe, pending:w.pending})),
-      recentRuns: sortedRuns().slice(0, 8).map(r => ({ date:r.date, km:+(r.distanceM/1000).toFixed(2), minutes:Math.round(r.durationS/60), pace:R.fmtPace(R.avgPace(r)), feeling:r.feeling ? {rpe:r.feeling.rpe, breathing:r.feeling.breathing, fatigue:r.feeling.fatigue, pain:!!r.feeling.pain} : null })),
-      upcoming: S.workouts.filter(w => w.status === 'planned' && w.date >= today && w.date < R.addDays(today, 14)).sort(byDate).slice(0, 7).map(w => ({date:w.date, title:w.title, min:Math.round(R.totalMin(w.items)), type:w.kind})),
-      forecast5K: (() => { const f=R.predictRace(5,S.runs); return f.ok ? {time:R.fmtDur(f.mid),confidence:f.confidence} : {available:false, reason:f.reason}; })(),
+      contextVersion: '7.2', today,
+      dataRules: [
+        'Para evaluar la forma ACTUAL solo se usan carreras de los ultimos 42 dias; las anteriores se excluyen del analisis deportivo actual.',
+        'El perfil se recalcula de forma automatica usando solo datos recientes y no esta condicionado por las marcas antiguas.',
+        'Duracion total o moving_time NO es igual a minutos continuos sin caminar; la base del plan es una estimacion conservadora.',
+        'Un ritmo mas rapido no demuestra por si solo mejor forma si cambian distancia o esfuerzo.',
+        'El coach puede recomendar ajustes, pero cualquier modificacion de sesiones desde el chat requiere accion del usuario.'
+      ],
+      goal: { title: S.goal.title, date: S.goal.date, distanceKm: S.goal.distanceKm,
+        daysUntil: Math.max(0, R.diffDays(today, S.goal.date)) },
+      runner: {
+        profile: { source: f.fromData ? 'automatico: ultimos 42 dias' : 'provisional: pocos datos recientes',
+          easyPaceMinKm: R.fmtPace(p.easyPace), resistanceBaseEstimateMin: p.continuousMin,
+          resistanceBaseIsVerifiedContinuous: false, weeklySessions: p.weeklySessions,
+          confidence: f.confidence, evidenceRuns: f.runsConsidered },
+        longestRecordedSessionLast42Days: longestTotal ? { date: longestTotal.date,
+          durationMin: +(longestTotal.durationS / 60).toFixed(1), km: +(longestTotal.distanceM / 1000).toFixed(2),
+          note: 'Minutos de movimiento, NO demuestra continuidad sin caminar.' } : null
+      },
+      currentEvidence: { analysisWindowDays: 42, currentRunCount: currentRuns.length,
+        olderRunCountExcludedFromCurrentFitness: all.length - currentRuns.length,
+        mostRecent: latest ? {date: latest.date, km: +(latest.distanceM/1000).toFixed(2),
+          paceMinKm: R.fmtPace(R.avgPace(latest))} : null },
+      weeks: [weeklyDigest(R.mondayOf(today)), weeklyDigest(R.addDays(R.mondayOf(today), -7))]
+        .map(w => ({ week:w.start, km:+w.km.toFixed(2), runs:w.sessions, minutes:Math.round(w.min), avgRpe:w.avgRpe, pending:w.pending })),
+      recentRuns: currentRuns.slice(0,8).map(r => ({ date:r.date, km:+(r.distanceM/1000).toFixed(2),
+        minutes:+(r.durationS/60).toFixed(1), paceMinKm:R.fmtPace(R.avgPace(r)),
+        reportedFeeling:r.feeling ? {rpe:r.feeling.rpe, breathing:r.feeling.breathing,
+          fatigue:r.feeling.fatigue, pain:!!r.feeling.pain, couldContinue:!!r.feeling.canContinue} : null,
+        originalPlan:plannedFor(r), automaticPlanChanges:(r.autoChanges||[]).length })),
+      upcoming: S.workouts.filter(w => w.status==='planned' && w.date >= today && w.date < R.addDays(today,14))
+        .sort(byDate).slice(0,7).map(w => ({ date:w.date, title:w.title,
+          minutes:Math.round(R.totalMin(w.items)), approxKm:+R.distKm(w.items).toFixed(2), type:w.kind,
+          origin:w.manual?'manual':'automatic', lastAdjustment:(w.explanation||'').slice(0,130) })),
+      forecast5K:(() => {const x=R.predictRace(5,S.runs);return x.ok?
+        {time:R.fmtDur(x.mid),confidence:x.confidence,method:'Formula estimativa; no es garantia de tiempo de carrera.'}:
+        {available:false,reason:x.reason};})()
     };
   }
 
@@ -467,7 +522,7 @@
     const t = R.today(), g = S.goal, days = Math.max(R.diffDays(t, g.date), 0), maintain = g.kind === 'maintain';
     const closed = S.goals.filter(x => (x.status === 'achieved' || x.status === 'missed') && !x.seen).slice(-1)[0];
     const fit = fitNow(), pf = S.profile;
-    const review = fit.fromData && (!pf.lastReplan || R.diffDays(pf.lastReplan, t) >= 7) && (Math.abs(fit.easyPace - pf.easyPace) >= 10 || Math.abs(fit.baseMin - pf.continuousMin) >= 2);
+    const review = fit.fromData; // panel de perfil automatico, no pide actualizar datos manuales
     const next = S.workouts.filter(w => w.status === 'planned' && w.date >= t).sort(byDate)[0];
     const ws = R.mondayOf(t), we = R.addDays(ws, 7), wr = S.runs.filter(r => r.date >= ws && r.date < we);
     const due = S.workouts.filter(w => w.date >= ws && w.date < we && w.status !== 'discarded' &&
@@ -481,7 +536,11 @@
     ${maintain
       ? `<div class="card row between"><div><h3>Modo mantenimiento</h3><div class="sub">Sin carrera fijada: semanas variadas con una más suave cada cuatro. El plan se renueva solo.</div></div><button data-act="goals-open">Objetivos</button></div>`
       : `<div class="card row between"><div><h3>${esc(g.title)}</h3><div class="sub">${R.longDate(g.date)}${g.kind === 'time' && g.targetTimeSec ? ' · objetivo ' + R.fmtDur(g.targetTimeSec) : ''}</div><button class="link" data-act="goals-open">Objetivos</button></div><div style="text-align:center"><div class="big">${days}</div><div class="sub small">días</div></div></div>`}
-    ${review ? `<div class="card"><h2>Revisión semanal</h2><div class="sub">${esc(fit.note)}</div><p style="margin:6px 0">En tu perfil tienes ${R.fmtPace(pf.easyPace)} min/km y ${pf.continuousMin} min seguidos. Si lo aceptas, actualizo el perfil y regenero las sesiones futuras con tu forma real (las que creaste tú se conservan).</p><div class="btns"><button class="primary" data-act="replan-ok">Replanificar con mi forma real</button><button data-act="replan-no">Ahora no</button></div></div>` : ''}
+    ${review ? `<div class="card"><h2>Mi perfil, calculado automáticamente</h2>
+      <div class="stats"><div><b>${R.fmtPace(fit.easyPace)}</b><span>ritmo cómodo orientativo</span></div><div><b>${fit.baseMin}</b><span>min de base estimada</span></div><div><b>${Math.round(fit.longestMovingMin)}</b><span>min máx. en movimiento</span></div><div><b>${fit.runsConsidered}</b><span>salidas recientes</span></div></div>
+      <div class="sub" style="margin-top:8px">Solo las carreras de los últimos 42 días influyen en tu forma actual. Confianza ${fit.confidence}. El tiempo continuo es una estimación conservadora, no una medición de minutos sin caminar.</div>
+      <div class="btns"><button data-act="replan-ok">Recalcular mis sesiones futuras</button></div></div>` :
+      `<div class="card"><h2>Mi perfil</h2><div class="sub">Faltan salidas recientes para actualizarlo automáticamente. No tomaré las carreras del año pasado como referencia de tu forma actual.</div></div>`}
     ${S.notes && S.notes.length ? S.notes.map(n => `<div class="note warn">${esc(n)}</div>`).join('') : ''}
     <div class="card"><h2>Próximo entrenamiento</h2>${next
       ? `<div data-act="wk-open" data-id="${next.id}" style="cursor:pointer"><h3>${esc(next.title)}</h3><div class="sub">${R.longDate(next.date)}</div><p style="margin:6px 0">${esc(next.objective)}</p><div class="sub">${wkSummary(next)}</div></div>`
@@ -689,8 +748,11 @@
     return `<h1>Ajustes</h1>
     <div class="card"><h2>Corredor</h2>${num('Edad', 'profile.age', p.age)}${num('Altura (cm)', 'profile.heightCm', p.heightCm)}${num('Peso (kg)', 'profile.weightKg', p.weightKg)}
       <label>Nivel</label><input data-s="profile.level" value="${esc(p.level)}">
-      ${num('Minutos que corro seguidos hoy', 'profile.continuousMin', p.continuousMin)}
-      <label>Ritmo cómodo (min:seg por km)</label><input data-s="profile.easyPace" data-t="pace" value="${R.fmtPace(p.easyPace)}">
+      <label>Perfil de entrenamiento (automático con Strava)</label>
+      <div class="note">${fitNow().fromData ?
+        `Ritmo cómodo orientativo: <b>${R.fmtPace(p.easyPace)} min/km</b> · Base de resistencia estimada: <b>${p.continuousMin} min</b> · Referencia: ${fitNow().runsConsidered} salidas en 42 días. El tiempo sin caminar no se puede demostrar solo con Strava.` :
+        `Aún no hay 2 carreras válidas en los últimos 42 días. Hasta entonces utilizamos provisionalmente ${R.fmtPace(p.easyPace)} min/km y ${p.continuousMin} min de base.`}</div>
+      ${fitNow().fromData ? '' : `${num('Base provisional (minutos)', 'profile.continuousMin', p.continuousMin)}<label>Ritmo provisional (min:seg por km)</label><input data-s="profile.easyPace" data-t="pace" value="${R.fmtPace(p.easyPace)}">`}
       ${num('Sesiones por semana', 'profile.weeklySessions', p.weeklySessions)}
       <label>FC máxima real (vacío = estimada ${R.maxHR({ ...p, maxHROverride: null })} lpm, fórmula 208 − 0,7 × edad)</label><input type="number" inputmode="numeric" data-s="profile.maxHROverride" data-t="nullnum" value="${p.maxHROverride ?? ''}">
       <div class="note">«Minutos seguidos» y «ritmo cómodo» determinan el plan: pon valores reales; la app no los adivina.</div></div>
@@ -870,6 +932,7 @@
         if (ex.title === 'Pádel') S.extras = S.extras.filter(e => !(e.auto && e.date === ex.date));
         S.extras.push(ex);
       });
+      if (imported.length) applyFitness(); // perfil automatico tras nuevas carreras
       S.strava.lastSync = new Date().toISOString();
       ui.stravaMsg = (imported.length ? `${imported.length} carrera(s) nueva(s) importada(s).` : 'Sin carreras nuevas.') + (newExtras.length ? ` ${newExtras.length} otra(s) actividad(es) añadida(s).` : '');
       if (imported.length) {
@@ -980,18 +1043,18 @@
       if (!(km > 0) || !(dur > 0) || !date) { toast('Pon fecha, distancia y duración'); return; }
       const hr = parseFloat($('#rHR').value) || null;
       const run = { id: R.uid(), stravaId: null, source: 'manual', name: '', date, start: new Date(date + 'T08:00:00').toISOString(), distanceM: km * 1000, durationS: dur, avgHR: hr, maxHR: null, cadence: null, elevation: null, splits: [], feeling: null, evaluation: null, adviceFactor: null, adviceRecovery: null, adviceHandled: false, workoutId: null };
-      S.runs.push(run); linkRun(run); save(); ui.modal = { type: 'run', id: run.id };
+      S.runs.push(run); linkRun(run); applyFitness(); ui.modal = { type: 'run', id: run.id };
     },
     'feel-save': d => {
       const r = runById(d.id);
       r.feeling = { rpe: +$('#fRpe').value, breathing: +$('#fBr').value, fatigue: +$('#fFa').value, pain: $('#fPain').value.trim(), canContinue: $('#fCan').checked };
       const hist = S.runs.filter(x => x.id !== r.id && Date.parse(x.start) <= Date.parse(r.start));
       const a = R.evaluate(r, [...hist, r], S.profile);
-      r.evaluation = a.summary; r.adviceFactor = a.factor; r.adviceRecovery = a.recovery; r.adviceHandled = false; save();
+      r.evaluation = a.summary; r.adviceFactor = a.factor; r.adviceRecovery = a.recovery; r.adviceHandled = false; applyFitness();
     },
     'advice-apply': d => { const r = runById(d.id), w = nextPlannedAfter(r.date); if (w) { applyAdvice(w, r.adviceFactor, r.adviceRecovery, r.evaluation); r.coachAdviceApplied = { workoutId: w.id, title: w.title }; } r.adviceHandled = true; save(); if (w) toast('Aplicado a «' + w.title + '»'); },
     'advice-no': d => { runById(d.id).adviceHandled = true; save(); },
-    'run-del': d => { if (!confirm('¿Borrar esta carrera?')) return; const r = runById(d.id); if (r) restoreRunPlan(r); S.runs = S.runs.filter(x => x.id !== d.id); ui.modal = null; save(); },
+    'run-del': d => { if (!confirm('¿Borrar esta carrera?')) return; const r = runById(d.id); if (r) restoreRunPlan(r); S.runs = S.runs.filter(x => x.id !== d.id); ui.modal = null; applyFitness(); },
     'load-splits': async d => {
       const r = runById(d.id); ui.busy = true;
       try { const det = await stravaFetch('/activities/' + r.stravaId); r.splits = R.stravaToRun(det, det).splits; save(); } catch (e) { toast(e.message); }
@@ -1104,7 +1167,7 @@
     const el = e.target;
     if (el.id === 'file') {
       const f = el.files[0]; if (!f) return;
-      f.text().then(t => { try { const o = JSON.parse(t); if (o.v !== 1) throw 0; S = ensureShape(o); reconcileExistingRuns(); lifecycle(); save(); toast('Copia importada'); } catch (x) { toast('Archivo no válido'); } render(); }); return;
+      f.text().then(t => { try { const o = JSON.parse(t); if (o.v !== 1) throw 0; S = ensureShape(o); reconcileExistingRuns(); applyFitness(); lifecycle(); save(); toast('Copia importada'); } catch (x) { toast('Archivo no válido'); } render(); }); return;
     }
     if (el.dataset.ui) {   // estado de la interfaz (sin re-render para no perder el foco)
       const [a, b] = el.dataset.ui.split('.');
@@ -1142,6 +1205,7 @@
   /* ---------------- Arranque ---------------- */
   handleHash();
   reconcileExistingRuns();
+  applyFitness(); // al actualizar la app, recalcula con los entrenos ya guardados
   lifecycle();
   handleMissed();
   render();
