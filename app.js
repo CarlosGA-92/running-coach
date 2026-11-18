@@ -118,9 +118,138 @@
     save();
   }
   const nextPlannedAfter = date => S.workouts.filter(w => w.status === 'planned' && w.date > date && w.kind !== 'carreraObjetivo').sort(byDate)[0];
+  /* La carrera REAL es la referencia. La sesión planeada se conserva solo como
+     comparación, pero no vuelve a mostrarse como pendiente/completada en el calendario. */
+  function plannedSnapshot(w) {
+    const durationS = Math.round(R.totalMin(w.items) * 60);
+    const distanceM = R.distKm(w.items) * 1000;
+    return { id: w.id, title: w.title, kind: w.kind, date: w.date, durationS, distanceM,
+      paceSec: distanceM > 0 ? durationS / (distanceM / 1000) : null };
+  }
+  function eligibleForRun(w, run) {
+    if (w.kind === 'carreraObjetivo') return w.date === run.date;
+    if (w.status === 'planned') return true;
+    // Se puede recuperar una sesión que fue marcada como perdida automáticamente;
+    // las canceladas manualmente solamente se recuperan si coinciden exactamente.
+    return w.status === 'skipped' && (w.date === run.date || !String(w.explanation || '').startsWith('Marcada por ti'));
+  }
+  function rememberPlanChange(run, w) {
+    (run.autoChanges ||= []).push({ id: w.id, before: {
+      date: w.date, status: w.status, explanation: w.explanation, items: JSON.parse(JSON.stringify(w.items)),
+    } });
+  }
+  function avoidCrowding(run) {
+    // No reescribimos semanas antiguas al importar mucho histórico.
+    const today = R.today(), first = R.mondayOf(run.date), end = R.addDays(first, 6);
+    if (end < today || R.diffDays(run.date, today) > 7) return;
+    const remaining = S.workouts.filter(w => w.status === 'planned' && w.date >= today &&
+      w.date >= run.date && w.date <= end && w.kind !== 'carreraObjetivo')
+      .sort(byDate);
+    let softened = false;
+    for (const w of remaining) {
+      const conflict = S.runs.some(r => Math.abs(R.diffDays(r.date, w.date)) < 2);
+      if (conflict) {
+        if (w.manual) {
+          w.explanation = 'Aviso: esta sesión creada por ti queda muy cerca de una carrera real; revisa la recuperación antes de hacerla.';
+          continue;
+        }
+        const old = w.date;
+        let slot = null;
+        const earliest = [today, R.addDays(run.date, 2)].sort().pop();
+        for (let d = earliest; d <= end; d = R.addDays(d, 1)) {
+          if (S.unavailable.includes(d) || S.profile.noRun.includes(R.weekday(d))) continue;
+          if (S.runs.some(r => Math.abs(R.diffDays(r.date, d)) < 2)) continue;
+          if (S.workouts.some(x => x.id !== w.id && x.status === 'planned' && Math.abs(R.diffDays(x.date, d)) < 2)) continue;
+          if (S.extras.some(e => e.date === d && e.intense)) continue;
+          if (R.violatesIntensity(snap(), w, d)) continue;
+          slot = d; break;
+        }
+        rememberPlanChange(run, w);
+        if (slot) {
+          w.date = slot;
+          w.explanation = `Reajustada del ${R.longDate(old)} al ${R.longDate(slot)}: así tienes al menos un día sin correr después de la salida real.`;
+        } else {
+          w.status = 'discarded';
+          w.explanation = 'Retirada de esta semana para evitar acumular sesiones y correr sin suficiente recuperación tras la salida real.';
+        }
+      }
+      // Si la salida fue bastante más larga de lo programado, suavizamos solo una
+      // próxima sesión; nunca aumentamos carga para "recuperar" minutos perdidos.
+      if (!softened && run.planned && run.durationS > run.planned.durationS * 1.25 &&
+          w.status === 'planned' && w.date > run.date && !w.manual) {
+        rememberPlanChange(run, w);
+        const factor = run.durationS > run.planned.durationS * 1.7 ? 0.85 : 0.9;
+        R.scale(w, factor, 'Salida real más larga que la prevista; priorizamos recuperación.');
+        softened = true;
+      }
+    }
+  }
   function linkRun(run) {
-    const w = S.workouts.find(x => x.date === run.date && x.status === 'planned');
-    if (w) { w.status = 'completed'; w.runId = run.id; run.workoutId = w.id; }
+    if (run.planProcessed) return false;
+    // Migración: carreras ya vinculadas por versiones anteriores.
+    let w = run.workoutId ? S.workouts.find(x => x.id === run.workoutId) : null;
+    if (!w) {
+      const start = R.mondayOf(run.date), end = R.addDays(start, 6);
+      const options = S.workouts.filter(x => !x.runId && x.date >= start && x.date <= end && eligibleForRun(x, run));
+      // La sesion mas cercana de la misma semana: mismo dia, luego menor
+      // distancia temporal. En empate, preferimos una anterior no realizada,
+      // para no dejarla marcada como incumplida y duplicar el resto de la carga.
+      options.sort((a, b) => {
+        const da = Math.abs(R.diffDays(a.date, run.date)), db = Math.abs(R.diffDays(b.date, run.date));
+        return da - db || a.date.localeCompare(b.date);
+      });
+      w = options[0] || null;
+    }
+    if (w) {
+      run.planned ||= plannedSnapshot(w);
+      run.workoutId = w.id;
+      w.status = 'completed'; w.runId = run.id;
+      w.completedOn = run.date;
+      // Otras sesiones del mismo día no deben figurar como incumplidas cuando
+      // el entrenamiento real ya ha sustituido la actividad prevista.
+      S.workouts.filter(x => x.id !== w.id && x.date === run.date && x.status === 'planned' &&
+          x.kind !== 'carreraObjetivo').forEach(x => {
+        rememberPlanChange(run, x);
+        x.status = 'discarded';
+        x.explanation = 'Sustituida por la carrera real de ese día.';
+      });
+      avoidCrowding(run);
+    }
+    run.planProcessed = true;
+    return !!w;
+  }
+  function reconcileExistingRuns() {
+    let changed = false;
+    S.runs.slice().sort((a, b) => (a.start || '').localeCompare(b.start || '')).forEach(run => {
+      if (run.planProcessed) return;
+      linkRun(run); changed = true;
+    });
+    if (changed) save();
+  }
+  function restoreRunPlan(run) {
+    (run.autoChanges || []).slice().reverse().forEach(c => {
+      const w = wkById(c.id); if (!w) return;
+      w.date = c.before.date; w.status = c.before.status; w.explanation = c.before.explanation;
+      w.items = c.before.items;
+    });
+    const w = run.workoutId && wkById(run.workoutId);
+    if (w && w.runId === run.id) {
+      w.status = 'planned'; w.runId = null; delete w.completedOn;
+      // La fecha original nunca se modificó al vincularla.
+    }
+  }
+  function runPlanComparison(run) {
+    const p = run.planned;
+    if (!p) return '<div class="card"><h2>Plan y realidad</h2><div class="sub">Carrera libre, sin entrenamiento del plan asignado.</div></div>';
+    const kmDelta = (run.distanceM - p.distanceM) / 1000;
+    const minDelta = (run.durationS - p.durationS) / 60;
+    const signed = (x, digits) => `${x > 0 ? '+' : ''}${x.toFixed(digits).replace('.', ',')}`;
+    return `<div class="card"><h2>Planificado vs. realizado</h2>
+      <div class="sub small">${esc(p.title)} · previsto para ${R.longDate(p.date)}${p.date === run.date ? '' : ' · realizado el ' + R.longDate(run.date)}</div>
+      <div class="row between" style="margin-top:8px"><span>Distancia</span><span>${R.fmtKm(p.distanceM / 1000)} → <b>${R.fmtKm(run.distanceM / 1000)} km</b> (${signed(kmDelta,2)} km)</span></div>
+      <div class="row between"><span>Duración</span><span>${R.fmtDur(p.durationS)} → <b>${R.fmtDur(run.durationS)}</b> (${signed(minDelta,1)} min)</span></div>
+      <div class="row between"><span>Ritmo medio</span><span>${R.fmtPace(p.paceSec)} → <b>${R.fmtPace(R.avgPace(run))}</b></span></div>
+      <div class="sub small" style="margin-top:8px">El ritmo previsto es orientativo: incluye calentamiento y recuperación. Se conserva el plan original para compararlo, pero el calendario muestra solo la carrera real.</div></div>`;
   }
   const wkById = id => S.workouts.find(w => w.id === id);
   const runById = id => S.runs.find(r => r.id === id);
@@ -164,7 +293,8 @@
     const review = fit.fromData && (!pf.lastReplan || R.diffDays(pf.lastReplan, t) >= 7) && (Math.abs(fit.easyPace - pf.easyPace) >= 10 || Math.abs(fit.baseMin - pf.continuousMin) >= 2);
     const next = S.workouts.filter(w => w.status === 'planned' && w.date >= t).sort(byDate)[0];
     const ws = R.mondayOf(t), we = R.addDays(ws, 7), wr = S.runs.filter(r => r.date >= ws && r.date < we);
-    const due = S.workouts.filter(w => w.date >= ws && w.date < we && w.date <= t && w.status !== 'discarded');
+    const due = S.workouts.filter(w => w.date >= ws && w.date < we && w.status !== 'discarded' &&
+      (w.date <= t || (w.status === 'completed' && w.completedOn && w.completedOn <= t)));
     const comp = due.length ? Math.round(due.filter(w => w.status === 'completed').length / due.length * 100) + ' %' : '–';
     const pending = sortedRuns().find(r => !r.feeling);
     const rec = R.recovery(S.runs);
@@ -205,30 +335,47 @@
     if (ui.calMode === 'week') {
       const ws = R.mondayOf(ui.calAnchor), we = R.addDays(ws, 6), a = R.parseDate(ws), b = R.parseDate(we);
       head = `${a.getDate()} ${R.MONTHS[a.getMonth()].slice(0, 3)} – ${b.getDate()} ${R.MONTHS[b.getMonth()].slice(0, 3)}`;
-      body = `<div class="card">${Array.from({ length: 7 }, (_, i) => dayHtml(R.addDays(ws, i))).join('')}</div>`;
+      const real = S.runs.filter(r => r.date >= ws && r.date <= we);
+      const pending = S.workouts.filter(w => w.status === 'planned' && w.date >= ws && w.date <= we);
+      const moved = real.filter(r => r.planned && r.planned.date !== r.date);
+      const weeklyNote = `<div class="card"><h2>Resumen de la semana</h2><div class="sub">${real.length} salida(s) realizadas · ${pending.length} sesión(es) pendientes.</div>
+        ${moved.map(r => `<div class="sub small" style="margin-top:6px">La carrera del ${R.longDate(r.date)} sustituye la sesión prevista para el ${R.longDate(r.planned.date)}.</div>`).join('')}
+        <div class="sub small" style="margin-top:6px">El plan restante solo se reajusta si hay muy poca recuperación o una salida mucho más larga de lo previsto.</div></div>`;
+      body = weeklyNote + `<div class="card">${Array.from({ length: 7 }, (_, i) => dayHtml(R.addDays(ws, i))).join('')}</div>`;
     } else {
       const d = R.parseDate(ui.calAnchor), first = new Date(d.getFullYear(), d.getMonth(), 1), n = new Date(d.getFullYear(), d.getMonth() + 1, 0).getDate();
       head = `${R.MONTHS[d.getMonth()]} ${d.getFullYear()}`;
       let cells = ['L', 'M', 'X', 'J', 'V', 'S', 'D'].map(x => `<div class="h">${x}</div>`).join('') + '<div></div>'.repeat((first.getDay() + 6) % 7);
       for (let i = 1; i <= n; i++) {
         const ds = R.fmtDate(new Date(d.getFullYear(), d.getMonth(), i));
-        const dots = S.workouts.filter(w => w.date === ds && w.status !== 'discarded' && w.status !== 'skipped').map(w => `<i style="background:${w.status === 'completed' ? 'var(--good)' : 'var(--accent)'}"></i>`).join('')
+        // Mes: las carreras reales también deben marcarse aunque no existiera una sesión planificada.
+        // Un punto verde por día con carrera real (sin duplicar la sesión vinculada al plan).
+        const hasRealRun = S.runs.some(r => r.date === ds);
+        const hasCompletedPlan = S.workouts.some(w => w.date === ds && w.status === 'completed' && !w.runId);
+        const pendingDots = S.workouts.filter(w => w.date === ds && w.status === 'planned')
+          .map(() => '<i style="background:var(--accent)"></i>').join('');
+        const dots = pendingDots
+          + (hasRealRun || hasCompletedPlan ? '<i style="background:var(--good)"></i>' : '')
           + (S.extras.some(e => e.date === ds) ? '<i style="background:#3b82f6"></i>' : '');
         cells += `<button class="c ${ui.calSel === ds ? 'sel' : ''} ${S.unavailable.includes(ds) ? 'nope' : ''}" data-act="cal-sel" data-d="${ds}">${i}<div class="dots">${dots}</div></button>`;
       }
       body = `<div class="card"><div class="grid7">${cells}</div></div><div class="card">${dayHtml(ui.calSel)}</div>`;
     }
     return `<h1>Calendario</h1>${seg}<div class="row between" style="margin-bottom:8px"><button data-act="cal-prev">‹</button><b style="text-transform:capitalize">${head}</b><button data-act="cal-next">›</button></div>${goalLine}${body}
-    <div class="sub small" style="margin:0 4px 8px">🚫 marcar el día como no disponible (reprograma o descarta lo que haya) · ✅ volver a disponible · ＋ añadir otra actividad (pádel…). Para mover una sesión, entra en ella y pulsa «Mover». En el mes: ● naranja pendiente, ● verde hecha, ● azul otra actividad.</div>`;
+    <div class="sub small" style="margin:0 4px 8px">🚫 marcar el día como no disponible (reprograma o descarta lo que haya) · ✅ volver a disponible · ＋ añadir otra actividad (pádel…). Para mover una sesión, entra en ella y pulsa «Mover». En el mes: ● naranja plan pendiente, ● verde carrera realizada, ● azul otra actividad.</div>`;
   }
   function dayHtml(ds) {
     const t = R.today(), blocked = S.unavailable.includes(ds), d = R.parseDate(ds);
-    const ws = S.workouts.filter(w => w.date === ds && w.status !== 'discarded').map(w =>
+    const ws = S.workouts.filter(w => w.date === ds && (w.status === 'planned' || w.status === 'skipped' || (w.status === 'completed' && !w.runId))).map(w =>
       `<div class="item" data-act="wk-open" data-id="${w.id}" style="cursor:pointer"><span class="dot" style="background:${w.status === 'completed' ? 'var(--good)' : w.status === 'skipped' ? 'var(--sub)' : 'var(--accent)'}"></span><div class="grow"><b>${esc(w.title)}</b><div class="sub small">${wkSummary(w)}${w.status === 'skipped' ? ' · no realizada' : ''}</div></div>›</div>`).join('');
+    // Mostrar cada carrera real importada desde Strava o introducida a mano.
+    // No se pierde ninguna carrera por no coincidir con una fecha de entrenamiento planificado.
+    const rs = S.runs.filter(r => r.date === ds).sort((a, b) => (a.start || '').localeCompare(b.start || '')).map(r =>
+      `<div class="item" data-act="run-open" data-id="${r.id}" style="cursor:pointer"><span class="dot" style="background:var(--good)"></span><div class="grow"><b>${esc(r.name || 'Carrera realizada')}</b><div class="sub small">${runLine(r)} · ${r.source === 'strava' ? 'Strava' : 'Registro manual'}${r.workoutId ? ' · Sustituye sesión del plan' : ''}</div></div>›</div>`).join('');
     const es = S.extras.filter(e => e.date === ds).map(e => `<div class="item"><span class="dot" style="background:#3b82f6"></span><div class="grow">${esc(e.title)} · ${e.durationMin} min</div><button class="link" data-act="extra-del" data-id="${e.id}">Borrar</button></div>`).join('');
     return `<div class="day"><div class="hd"><span class="${ds === t ? 'today' : ''}">${R.WEEKDAYS[d.getDay()]} ${d.getDate()} ${blocked ? '🚫' : ''}</span>
       <span><button class="link" aria-label="${blocked ? 'Marcar disponible' : 'Marcar no disponible'}" data-act="toggle-unavail" data-d="${ds}">${blocked ? '✅' : '🚫'}</button><button class="link" aria-label="Añadir actividad" data-act="extra-open" data-d="${ds}">＋</button></span></div>
-      ${ws}${es}${!ws && !es ? `<div class="sub small">${blocked ? 'No disponible' : 'Libre'}</div>` : ''}</div>`;
+      ${ws}${rs}${es}${!ws && !rs && !es ? `<div class="sub small">${blocked ? 'No disponible' : 'Libre'}</div>` : ''}</div>`;
   }
 
   /* ---- Entrenar ---- */
@@ -407,6 +554,7 @@
         <div class="stats" style="grid-template-columns:repeat(3,1fr);margin-top:8px"><div><b>${R.fmtKm(r.distanceM / 1000)}</b><span>km</span></div><div><b>${R.fmtDur(r.durationS)}</b><span>tiempo</span></div><div><b>${R.fmtPace(R.avgPace(r))}</b><span>min/km</span></div>
         <div><b>${r.avgHR ? Math.round(r.avgHR) : '–'}</b><span>FC media</span></div><div><b>${r.maxHR ? Math.round(r.maxHR) : '–'}</b><span>FC máx.</span></div><div><b>${r.cadence || '–'}</b><span>pasos/min</span></div></div>
         <div class="sub small" style="margin-top:6px">Desnivel +: ${r.elevation != null ? Math.round(r.elevation) + ' m' : '–'}</div></div>
+      ${runPlanComparison(r)}
       <div class="card"><h2>Parciales por km</h2>${sp.length ? barChart(sp.map(s => ({ l: s.km, y: s.paceSec / 60 })), v => v.toFixed(1)) + sp.map(s => `<div class="row between small"><span>km ${s.km}${s.partial ? ' (parcial)' : ''}</span><span>${R.fmtPace(s.paceSec)} min/km${s.hr ? ' · ' + Math.round(s.hr) + ' lpm' : ''}</span></div>`).join('') : `<div class="sub">${r.stravaId ? 'Aún no cargados.' : 'No disponibles en carreras manuales.'}</div>${r.stravaId && S.strava.tokens ? `<div class="btns"><button data-act="load-splits" data-id="${r.id}">Cargar parciales</button></div>` : ''}`}</div>
       <div class="card"><h2>Sensaciones</h2>
         <label>Esfuerzo percibido: <b id="rpeV">${f.rpe}</b>/10</label><input type="range" min="1" max="10" id="fRpe" value="${f.rpe}" oninput="document.getElementById('rpeV').textContent=this.value">
@@ -521,7 +669,7 @@
       for (const run of imported.slice(0, 12)) {
         try { const det = await stravaFetch('/activities/' + run.stravaId); const full = R.stravaToRun(det, det); run.splits = full.splits; } catch (e) { /* se pueden cargar luego */ }
       }
-      imported.forEach(r => { S.runs.push(r); linkRun(r); });
+      imported.slice().sort((a, b) => Date.parse(a.start) - Date.parse(b.start)).forEach(r => { S.runs.push(r); linkRun(r); });
       newExtras.forEach(ex => {   // el pádel real sustituye al «Pádel» automático de ese día
         if (ex.title === 'Pádel') S.extras = S.extras.filter(e => !(e.auto && e.date === ex.date));
         S.extras.push(ex);
@@ -573,7 +721,7 @@
     },
     'wk-skip': d => { const w = wkById(d.id); w.status = 'skipped'; w.explanation = 'Marcada por ti como no realizada.'; save(); ui.modal = null; },
     'wk-dup': d => {
-      const w = JSON.parse(JSON.stringify(wkById(d.id))); w.id = R.uid(); w.status = 'planned'; w.runId = null; w.explanation = 'Copia de otra sesión.'; w.manual = true; w.date = R.today(); if (w.kind === 'carreraObjetivo') w.kind = 'carreraContinua';
+      const w = JSON.parse(JSON.stringify(wkById(d.id))); w.id = R.uid(); w.status = 'planned'; w.runId = null; delete w.completedOn; w.explanation = 'Copia de otra sesión.'; w.manual = true; w.date = R.today(); if (w.kind === 'carreraObjetivo') w.kind = 'carreraContinua';
       S.workouts.push(w); save(); toast('Duplicada en hoy; muévela donde quieras'); openWk(w.id);
     },
     'wk-edit': d => { const w = wkById(d.id); ui.modal = { type: 'ed', id: w.id, draft: JSON.parse(JSON.stringify({ title: w.title, kind: w.kind, objective: w.objective, notes: w.notes, items: w.items })) }; },
@@ -612,7 +760,7 @@
     },
     'advice-apply': d => { const r = runById(d.id), w = nextPlannedAfter(r.date); if (w) applyAdvice(w, r.adviceFactor, r.adviceRecovery, r.evaluation); r.adviceHandled = true; save(); if (w) toast('Aplicado a «' + w.title + '»'); },
     'advice-no': d => { runById(d.id).adviceHandled = true; save(); },
-    'run-del': d => { if (!confirm('¿Borrar esta carrera?')) return; const r = runById(d.id); S.runs = S.runs.filter(x => x.id !== d.id); const w = S.workouts.find(x => x.runId === d.id); if (w) { w.status = 'planned'; w.runId = null; } ui.modal = null; save(); },
+    'run-del': d => { if (!confirm('¿Borrar esta carrera?')) return; const r = runById(d.id); if (r) restoreRunPlan(r); S.runs = S.runs.filter(x => x.id !== d.id); ui.modal = null; save(); },
     'load-splits': async d => {
       const r = runById(d.id); ui.busy = true;
       try { const det = await stravaFetch('/activities/' + r.stravaId); r.splits = R.stravaToRun(det, det).splits; save(); } catch (e) { toast(e.message); }
@@ -702,7 +850,7 @@
     const el = e.target;
     if (el.id === 'file') {
       const f = el.files[0]; if (!f) return;
-      f.text().then(t => { try { const o = JSON.parse(t); if (o.v !== 1) throw 0; S = ensureShape(o); lifecycle(); save(); toast('Copia importada'); } catch (x) { toast('Archivo no válido'); } render(); }); return;
+      f.text().then(t => { try { const o = JSON.parse(t); if (o.v !== 1) throw 0; S = ensureShape(o); reconcileExistingRuns(); lifecycle(); save(); toast('Copia importada'); } catch (x) { toast('Archivo no válido'); } render(); }); return;
     }
     if (el.dataset.ui) {   // estado de la interfaz (sin re-render para no perder el foco)
       const [a, b] = el.dataset.ui.split('.');
@@ -739,6 +887,7 @@
 
   /* ---------------- Arranque ---------------- */
   handleHash();
+  reconcileExistingRuns();
   lifecycle();
   handleMissed();
   render();

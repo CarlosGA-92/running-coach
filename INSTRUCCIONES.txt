@@ -1,0 +1,16 @@
+RUNNING COACH - Calendario inteligente
+
+Sube los 3 archivos app.js, index.html y sw.js al repositorio de GitHub, sustituyendo los anteriores.
+Deja core.js y los demas archivos sin modificar.
+
+Cambios:
+- Las carreras reales sustituyen visualmente a las sesiones previstas.
+- Se enlaza cada carrera con un entrenamiento de la misma semana (prioridad: mismo dia, luego siguiente).
+- Cada carrera muestra la comparativa con el plan original.
+- Si el resto de la semana tiene descanso insuficiente, se mueve o retira una sesion automatica.
+- Si una carrera supera significativamente la duracion planificada, se reduce una futura sesion automatica.
+- Incluye diagnostico de errores de Strava de la actualizacion anterior.
+- Se actualizan tambien carreras ya guardadas al abrir la app.
+
+Precaucion: en Ajustes > Tus datos > Exportar copia, haz una copia antes de sustituir.
+Al publicarse, abre Safari con https://carlosga-92.github.io/running-coach/ y reabre la app instalada.
