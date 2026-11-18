@@ -1,6 +1,6 @@
 /* Service worker mínimo: deja la app abrir sin conexión. Los datos están en localStorage, no aquí. */
-const CACHE = 'rca-v6';
-const FILES = ['./', './index.html', './style.css', './core.js', './app.js?v=6', './manifest.webmanifest', './icon-180.png', './icon-192.png', './icon-512.png'];
+const CACHE = 'rca-v7';
+const FILES = ['./', './index.html', './style.css', './core.js?v=7', './app.js?v=7', './manifest.webmanifest', './icon-180.png', './icon-192.png', './icon-512.png'];
 self.addEventListener('install', e => { e.waitUntil(caches.open(CACHE).then(c => c.addAll(FILES)).then(() => self.skipWaiting())); });
 self.addEventListener('activate', e => {
   e.waitUntil(caches.keys().then(ks => Promise.all(ks.filter(k => k !== CACHE).map(k => caches.delete(k)))).then(() => self.clients.claim()));

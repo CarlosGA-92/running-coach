@@ -12,7 +12,7 @@
   /* ---------------- Estado ---------------- */
   function freshState() {
     const s = { v: 1, profile: R.defaultProfile(), goal: R.defaultGoal(), goals: [], weights: [], workouts: [], extras: [], unavailable: [], runs: [], chat: [], notes: [],
-      strava: { worker: '', tokens: null, lastSync: null }, savedAt: null };
+      strava: { worker: '', tokens: null, lastSync: null, lastAutoAttempt: null }, weeklyDecisions: {}, savedAt: null };
     s.goals = [s.goal];
     const plan = R.generatePlan(s.profile, s.goal, new Set(), nowObj());
     s.workouts = plan.workouts; s.extras = plan.extras; s.notes = plan.notes;
@@ -22,6 +22,8 @@
   function ensureShape(s) {
     s.goals = Array.isArray(s.goals) ? s.goals : [];
     s.weights = Array.isArray(s.weights) ? s.weights : [];
+    s.weeklyDecisions = s.weeklyDecisions && typeof s.weeklyDecisions === 'object' ? s.weeklyDecisions : {};
+    s.strava = Object.assign({ worker: '', tokens: null, lastSync: null, lastAutoAttempt: null }, s.strava || {});
     s.profile.lastReplan = s.profile.lastReplan || null;
     const base = { id: 'g1', kind: 'finish', status: 'active', targetTimeSec: null, resultSec: null, achievedRunId: null };
     const cur = Object.assign({}, base, s.goal || R.defaultGoal());
@@ -44,7 +46,7 @@
   const snap = () => ({ workouts: S.workouts, extras: S.extras, unavailable: S.unavailable, profile: S.profile, goal: S.goal, runs: S.runs });
 
   const ui = { tab: 'home', calMode: 'week', calAnchor: R.today(), calSel: R.today(), period: 30, filter: 'all', modal: null,
-    create: { text: '', kind: 'rodajeSuave', date: R.today(), preview: null }, busy: false, stravaMsg: '', pseg: 'runs', cmpA: '', cmpB: '' };
+    create: { text: '', kind: 'rodajeSuave', date: R.today(), preview: null }, busy: false, aiBusy: false, stravaMsg: '', pseg: 'runs', cmpA: '', cmpB: '' };
 
   function toast(msg) { const t = $('#toast'); t.textContent = msg; t.classList.add('on'); clearTimeout(toast._t); toast._t = setTimeout(() => t.classList.remove('on'), 3200); }
 
@@ -371,6 +373,95 @@
   const wkSummary = w => `${Math.round(R.totalMin(w.items))} min · ≈ ${R.fmtKm(R.distKm(w.items))} km · ${R.INTENSITY[w.kind]}`;
   const runLine = r => `${R.fmtKm(r.distanceM / 1000)} km · ${R.fmtDur(r.durationS)} · ${R.fmtPace(R.avgPace(r))} min/km`;
 
+
+  /* ---------------- V7: lectura objetiva de la semana ---------------- */
+  function weeklyDigest(start) {
+    const end = R.addDays(start, 7);
+    const runs = S.runs.filter(r => r.date >= start && r.date < end);
+    const sched = S.workouts.filter(w => w.date >= start && w.date < end && w.kind !== 'carreraObjetivo');
+    const totalM = runs.reduce((a, r) => a + (r.distanceM || 0), 0);
+    const totalS = runs.reduce((a, r) => a + (r.durationS || 0), 0);
+    const feedbacks = runs.filter(r => r.feeling).map(r => r.feeling);
+    return { start, runs, sessions: runs.length, km: totalM / 1000, min: totalS / 60,
+      pace: totalM > 0 ? totalS / (totalM / 1000) : null,
+      planned: sched.length, done: sched.filter(w => w.status === 'completed').length,
+      pending: sched.filter(w => w.status === 'planned').length,
+      skipped: sched.filter(w => w.status === 'skipped').length,
+      adapted: sched.filter(w => w.status === 'discarded').length,
+      avgRpe: feedbacks.length ? feedbacks.reduce((n, f) => n + (f.rpe || 0), 0) / feedbacks.length : null };
+  }
+  function weeklyProposal() {
+    const now = R.today(), next = R.addDays(R.mondayOf(now), 7), end = R.addDays(next, 7);
+    const all = S.workouts.filter(w => w.status === 'planned' && !w.manual && w.date >= next && w.date < end && w.kind !== 'carreraObjetivo');
+    const upcomingRace = S.goal.kind !== 'maintain' && S.goal.date >= next && S.goal.date < end;
+    const inLast14 = S.runs.filter(r => r.date >= R.addDays(now, -13) && r.date <= now);
+    const prior14 = S.runs.filter(r => r.date >= R.addDays(now, -27) && r.date < R.addDays(now, -13));
+    const minutes = arr => arr.reduce((n, r) => n + r.durationS / 60, 0);
+    const last = inLast14.slice().sort((a, b) => b.date.localeCompare(a.date))[0];
+    const feltHard = inLast14.some(r => r.feeling && (r.feeling.pain || r.feeling.rpe >= 8 || r.feeling.fatigue >= 4 || r.feeling.breathing >= 4));
+    const feltComfortable = inLast14.filter(r => r.feeling && r.feeling.rpe <= 5 && r.feeling.breathing <= 2 && r.feeling.fatigue <= 2 && !r.feeling.pain).length;
+    let factor = 1, reason;
+    if (!all.length) reason = 'No hay sesiones automáticas pendientes para ajustar la próxima semana.';
+    else if (feltHard) { factor = 0.9; reason = 'Hay señales de esfuerzo alto o molestias en las sensaciones recientes: sugiero reducir un 10 % los bloques de esfuerzo.'; }
+    else if (upcomingRace) reason = 'La próxima semana incluye la carrera objetivo: mantengo la descarga prevista, sin aumentar carga.';
+    else if (inLast14.length >= 3 && prior14.length >= 2 && feltComfortable >= 2 && minutes(inLast14) <= minutes(prior14) * 1.10) {
+      factor = 1.05;
+      reason = 'Has mantenido la regularidad con al menos dos salidas cómodas: propongo un aumento prudente de hasta el 5 % en bloques de esfuerzo.';
+    } else reason = 'Aún no hay evidencia suficiente para subir o bajar la carga. Mantengo la planificación; tus salidas reales seguirán sustituyendo las previstas.';
+    if (last && R.diffDays(last.date, now) < 2 && feltHard) reason += ' Evita encadenar sesiones exigentes sin recuperación.';
+    return { week: next, ids: all.map(w => w.id), factor, reason, done: S.weeklyDecisions[next] || null };
+  }
+  function applyWeekDecision(accept) {
+    const p = weeklyProposal();
+    if (p.done || !p.ids.length) return false;
+    let modified = 0;
+    if (accept && Math.abs(p.factor - 1) > 0.001) {
+      for (const id of p.ids) {
+        const w = wkById(id);
+        if (w && w.status === 'planned' && !w.manual && w.kind !== 'carreraObjetivo') {
+          if (R.scale(w, p.factor, 'Revisión semanal aceptada: ' + p.reason)) modified++;
+        }
+      }
+    }
+    S.weeklyDecisions[p.week] = { accepted: accept, factor: accept ? p.factor : 1, modified, at: new Date().toISOString() };
+    save(); return true;
+  }
+  function weeklyReportHtml() {
+    const today = R.today(), monday = R.mondayOf(today), thisW = weeklyDigest(monday), prevW = weeklyDigest(R.addDays(monday, -7));
+    const delta = prevW.sessions ? thisW.km - prevW.km : null;
+    const p = weeklyProposal();
+    const note = thisW.avgRpe == null ? 'Faltan sensaciones de algunas carreras: el esfuerzo no se deduce del ritmo.' : `Esfuerzo medio declarado: ${fmtMin(thisW.avgRpe)}/10.`;
+    return `<div class="card"><h2>Tu semana · desde ${esc(R.longDate(monday))}</h2>
+      <div class="stats"><div><b>${R.fmtKm(thisW.km)}</b><span>km</span></div><div><b>${Math.round(thisW.min)}</b><span>min</span></div><div><b>${thisW.sessions}</b><span>salidas</span></div><div><b>${thisW.pace ? R.fmtPace(thisW.pace) : '–'}</b><span>ritmo medio</span></div></div>
+      <div class="sub" style="margin-top:10px">Plan: ${thisW.done} completadas · ${thisW.pending} pendientes · ${thisW.skipped} omitidas · ${thisW.adapted} reajustadas.</div>
+      <div class="sub">Semana anterior: ${R.fmtKm(prevW.km)} km y ${prevW.sessions} carreras.${delta !== null ? ' Diferencia: ' + (delta > 0 ? '+' : '') + R.fmtKm(delta) + ' km.' : ''}</div>
+      <div class="sub" style="margin-top:8px">${esc(note)}</div></div>
+      <div class="card"><h2>Propuesta para la próxima semana</h2><div class="sub">Semana del ${R.longDate(p.week)} · ${p.ids.length} sesión(es) automática(s).</div>
+      <p>${esc(p.reason)}</p>${p.done ? `<div class="note">${p.done.accepted ? 'Propuesta aceptada' : 'Propuesta descartada'} · ${p.done.modified || 0} sesiones modificadas.</div>` :
+       p.ids.length ? `<div class="btns"><button class="primary" data-act="weekly-accept">Aceptar propuesta</button><button data-act="weekly-decline">Mantener mi plan</button></div>` : ''}
+      <div class="sub small" style="margin-top:8px">El sistema no modifica sesiones creadas por ti. Los cambios de carga requieren aceptación; las salidas reales siguen adaptando el calendario según las reglas de la V6.</div></div>`;
+  }
+  function forecastTrend() {
+    const days = [...new Set(S.runs.filter(r => r.date).map(r => r.date))].sort().slice(-120);
+    return days.map(date => {
+      const ts = new Date(date + 'T23:59:59').getTime();
+      const past = S.runs.filter(r => Date.parse(r.start) <= ts);
+      const p = R.predictRace(5, past, ts);
+      return p.ok ? { x: ts, y: p.mid / 60, lo: p.low / 60, hi: p.high / 60, confidence: p.confidence } : null;
+    }).filter(Boolean).slice(-20);
+  }
+  function coachDataContext() {
+    const today = R.today(), p = S.profile;
+    return {
+      date: today, goal: { title: S.goal.title, date: S.goal.date, distanceKm: S.goal.distanceKm },
+      runner: { easyPaceMinKm: R.fmtPace(p.easyPace), continuousMin: p.continuousMin, weeklySessions: p.weeklySessions },
+      weeks: [weeklyDigest(R.mondayOf(today)), weeklyDigest(R.addDays(R.mondayOf(today), -7))].map(w => ({week:w.start, km:+w.km.toFixed(2), runs:w.sessions, minutes:Math.round(w.min), avgRpe: w.avgRpe, pending:w.pending})),
+      recentRuns: sortedRuns().slice(0, 8).map(r => ({ date:r.date, km:+(r.distanceM/1000).toFixed(2), minutes:Math.round(r.durationS/60), pace:R.fmtPace(R.avgPace(r)), feeling:r.feeling ? {rpe:r.feeling.rpe, breathing:r.feeling.breathing, fatigue:r.feeling.fatigue, pain:!!r.feeling.pain} : null })),
+      upcoming: S.workouts.filter(w => w.status === 'planned' && w.date >= today && w.date < R.addDays(today, 14)).sort(byDate).slice(0, 7).map(w => ({date:w.date, title:w.title, min:Math.round(R.totalMin(w.items)), type:w.kind})),
+      forecast5K: (() => { const f=R.predictRace(5,S.runs); return f.ok ? {time:R.fmtDur(f.mid),confidence:f.confidence} : {available:false, reason:f.reason}; })(),
+    };
+  }
+
   /* ---- Inicio ---- */
   function vHome() {
     const t = R.today(), g = S.goal, days = Math.max(R.diffDays(t, g.date), 0), maintain = g.kind === 'maintain';
@@ -398,7 +489,8 @@
     <div class="card"><h2>Recuperación estimada</h2><h3>${rec.level}</h3><div class="sub">${esc(rec.detail)}</div></div>
     ${latest ? `<div class="card" data-act="run-open" data-id="${latest.id}" style="cursor:pointer"><h2>Última carrera · Informe del coach</h2><h3>${esc(runReview(latest).title)}</h3><div class="sub">${runLine(latest)}</div><div class="sub" style="margin-top:6px">${esc(runReview(latest).planText)}</div><div class="btns"><button class="primary" data-act="run-open" data-id="${latest.id}">${latest.feeling ? 'Ver valoración y adaptación' : 'Ver informe y valorar sensaciones'}</button></div></div>` : ''}
     ${pending && latest && pending.id !== latest.id ? `<div class="card" data-act="run-open" data-id="${pending.id}" style="cursor:pointer"><b>Tienes una carrera pendiente de valorar</b><div class="sub">${runLine(pending)} · ${pending.date}</div></div>` : ''}
-    <div class="card"><h2>Esta semana</h2><div class="stats"><div><b>${R.fmtKm(wr.reduce((s, r) => s + r.distanceM / 1000, 0))}</b><span>km</span></div><div><b>${Math.round(wr.reduce((s, r) => s + r.durationS / 60, 0))}</b><span>min</span></div><div><b>${wr.length}</b><span>sesiones</span></div><div><b>${comp}</b><span>cumplimiento</span></div></div></div>
+    <div class="card"><h2>Tu semana · resumen automático</h2><div class="stats"><div><b>${R.fmtKm(wr.reduce((s, r) => s + r.distanceM / 1000, 0))}</b><span>km</span></div><div><b>${Math.round(wr.reduce((s, r) => s + r.durationS / 60, 0))}</b><span>min</span></div><div><b>${wr.length}</b><span>carreras</span></div><div><b>${comp}</b><span>cumplimiento</span></div></div>
+      <div class="btns"><button class="primary" data-act="week-report">Ver informe y propuesta</button></div></div>
     <div class="card"><h2>Strava</h2>${stravaCard()}</div>
     ${storageOk ? '' : '<div class="note bad">No puedo guardar datos en este navegador (¿modo privado?). Lo que hagas se perderá al cerrar.</div>'}`;
   }
@@ -552,7 +644,12 @@
     const a = runById(ui.cmpA), b = runById(ui.cmpB);
     let cmp = '';
     if (a && b && a.id !== b.id) { const [o, n] = a.start <= b.start ? [a, b] : [b, a], c = R.compareRuns(o, n); cmp = `<div style="margin-top:8px">${c.lines.map(l => `<div class="small">${esc(l)}</div>`).join('')}<div class="note">${esc(c.verdict)}</div><div class="sub small">Compara la más antigua con la más reciente.</div></div>`; }
-    return `<div class="card"><h2>Mi forma</h2><div class="sub">${esc(fit.note)}</div>${fit.weeklyMinutes ? `<div class="sub small">Media de las últimas 4 semanas: ${Math.round(fit.weeklyMinutes)} min de carrera por semana.</div>` : ''}</div>${cards}
+    const history = forecastTrend();
+    const historyCard = `<div class="card"><h2>Evolución de tu previsión de 5 km</h2>
+      ${history.length >= 2 ? lineChart(history, v => R.fmtDur(v * 60), 'var(--accent)', 'estimaciones') : '<div class="sub">Todavía faltan carreras para mostrar una tendencia de previsión fiable.</div>'}
+      ${history.length ? `<div class="sub small">Última estimación: ${R.fmtDur(history[history.length-1].y*60)} · confianza ${history[history.length-1].confidence.toLowerCase()}.</div>` : ''}
+      <div class="sub small">Cada punto utiliza únicamente las carreras registradas hasta esa fecha. Las previsiones son orientativas y dependen del tipo de sesión y del esfuerzo.</div></div>`;
+    return `<div class="card"><h2>Mi forma</h2><div class="sub">${esc(fit.note)}</div>${fit.weeklyMinutes ? `<div class="sub small">Media de las últimas 4 semanas: ${Math.round(fit.weeklyMinutes)} min de carrera por semana.</div>` : ''}</div>${historyCard}${cards}
       <div class="card"><h2>Comparar dos carreras</h2><div class="row"><select data-ui="cmpA">${opt(ui.cmpA)}</select><select data-ui="cmpB">${opt(ui.cmpB)}</select></div>${cmp}</div>
       <div class="note">Las previsiones salen de tus entrenos, no de una carrera a tope: son orientativas. Con pocos datos la app prefiere no dar cifra.</div>`;
   }
@@ -577,10 +674,11 @@
 
   /* ---- Coach ---- */
   function vCoach() {
-    const msgs = S.chat.length ? S.chat : [{ who: 'c', text: 'Hola, soy tu coach. Trabajo con tus carreras reales y tu calendario, y no cambio nada sin que lo aceptes. Prueba con: «El entrenamiento de ayer me resultó bastante cómodo. ¿Podemos aumentar un poco la siguiente sesión?»' }];
-    return `<h1>Coach</h1><div class="sub small" style="margin:-8px 2px 8px">Coach basado en reglas (no es un modelo de lenguaje). Entiende un conjunto limitado de frases.</div>
+    const msgs = S.chat.length ? S.chat : [{ who: 'c', text: 'Soy tu coach. Puedo ayudarte a interpretar las salidas y el calendario. Si la IA no está configurada, seguiré respondiendo con reglas. Nunca aplicaré una propuesta de chat sin tu permiso.' }];
+    return `<h1>Coach</h1><div class="sub small" style="margin:-8px 2px 8px">IA generativa con Cloudflare Workers AI cuando está configurada; si no, coach por reglas. Se envían solo métricas y sesiones resumidas, nunca claves, GPS ni tokens al modelo. La IA no modifica el calendario por sí sola.</div>
     ${msgs.map((m, i) => `<div class="msg ${m.who}">${esc(m.text)}</div>${m.proposal ? `<div class="prop"><div class="sub small">Propuesta</div><b>${esc(m.proposal.title)}</b>${m.state === 'ok' ? '<div class="good" style="margin-top:6px">✔ Aplicada al calendario</div>' : m.state === 'no' ? '<div class="sub" style="margin-top:6px">Descartada; el plan no ha cambiado</div>' : `<div class="btns"><button class="primary" data-act="prop-ok" data-i="${i}">Aceptar</button><button data-act="prop-no" data-i="${i}">Rechazar</button></div>`}</div>` : ''}`).join('')}
-    <div class="row" style="margin-top:10px"><input id="chatIn" class="grow" placeholder="Escribe a tu coach…" enterkeyhint="send"><button class="primary" data-act="chat-send">Enviar</button></div><div id="chatEnd"></div>`;
+    ${ui.aiBusy ? '<div class="note">El coach está preparando una respuesta…</div>' : ''}
+    <div class="row" style="margin-top:10px"><input id="chatIn" class="grow" placeholder="Pregunta a tu coach…" enterkeyhint="send" ${ui.aiBusy?'disabled':''}><button class="primary" data-act="chat-send" ${ui.aiBusy?'disabled':''}>Enviar</button></div><div id="chatEnd"></div>`;
   }
 
   /* ---- Ajustes ---- */
@@ -603,7 +701,11 @@
     <div class="card"><h2>Strava</h2>
       <label>Dirección de tu Worker (ver GUIA.md)</label><input data-s="strava.worker" data-t="url" placeholder="https://xxxx.workers.dev" value="${esc(S.strava.worker)}">
       ${S.strava.worker && !S.strava.tokens ? `<div class="sub small" style="margin-top:8px">Recomendado: pulsa «Obtener código», autoriza en Strava, copia el código que aparece y pégalo aquí.</div><div class="btns"><button class="primary" data-act="strava-manual">Obtener código</button></div><label>Código</label><input id="stCode" placeholder="Pega aquí el código"><div class="btns"><button data-act="strava-code">Usar código</button><button data-act="strava-connect">Conectar automáticamente</button></div>` : ''}
-      <div class="btns">${S.strava.worker && S.strava.tokens ? '<button data-act="strava-connect">Reautorizar</button>' : ''}${S.strava.tokens ? '<button data-act="strava-sync">Sincronizar</button><button class="danger" data-act="strava-disc">Desconectar</button>' : ''}</div></div>
+      <div class="btns">${S.strava.worker && S.strava.tokens ? '<button data-act="strava-connect">Reautorizar</button>' : ''}${S.strava.tokens ? '<button data-act="strava-sync">Sincronizar</button><button data-act="strava-athlete-id">Ver mi ID de atleta</button><button class="danger" data-act="strava-disc">Desconectar</button>' : ''}</div>
+      <div class="sub small" style="margin-top:8px">Sincronización automática al abrir o volver a la app si han pasado 15 minutos desde la última importación. Puedes sincronizar manualmente cuando quieras.</div></div>
+    <div class="card"><h2>IA generativa</h2>
+      <div class="sub">Se activa con un binding <b>AI</b> de Cloudflare Workers y la variable <b>ALLOWED_STRAVA_ATHLETE_ID</b> en tu Worker. Si no está configurada, el coach sigue funcionando por reglas.</div>
+      <div class="sub small" style="margin-top:8px">La IA recibe un resumen de las últimas carreras, sensaciones, objetivos y sesiones próximas; no recibe tus tokens, datos GPS ni datos de Strava sin resumir. Las recomendaciones nunca se aplican automáticamente.</div></div>
     <div class="card"><h2>Tus datos</h2><div class="sub small">Se guardan solo en este navegador. Haz copia de vez en cuando: si borras datos del sitio o desinstalas la app, se pierden.</div>
       <div class="btns"><button data-act="export">Exportar copia</button><button data-act="import">Importar copia</button><button class="danger" data-act="reset">Borrar todo</button></div><input type="file" id="file" accept="application/json" hidden></div>`;
   }
@@ -614,6 +716,7 @@
     let inner = '';
     if (m.type === 'msg') inner = top(esc(m.title)) + `<div class="card" style="white-space:pre-wrap">${esc(m.body)}</div>`;
     else if (m.type === 'goals') inner = top('Objetivos') + goalsHtml();
+    else if (m.type === 'weekly') inner = top('Informe semanal') + weeklyReportHtml();
     else if (m.type === 'wk') {
       const w = wkById(m.id); if (!w) return '';
       inner = top(esc(w.title)) + `<div class="card"><div class="sub">${R.KINDS[w.kind]} · ${R.longDate(w.date)}</div><div style="margin-top:4px">${wkSummary(w)}</div>${w.status !== 'planned' ? `<div class="sub" style="margin-top:4px">Estado: ${w.status === 'completed' ? 'completada' : w.status === 'skipped' ? 'no realizada' : 'descartada'}</div>` : ''}</div>
@@ -697,7 +800,7 @@
 
   /* ---------------- Strava ---------------- */
   const workerBase = () => S.strava.worker.replace(/\/+$/, '');
-  async function stravaFetch(path) {
+  async function ensureStravaToken() {
     const st = S.strava;
     if (!st.tokens) throw new Error('Strava no está autorizado.');
     if (st.tokens.expires_at < Date.now() / 1000 + 60) {
@@ -705,7 +808,11 @@
       if (!r.ok) throw new Error('No se pudo renovar el permiso de Strava (' + r.status + '). Vuelve a conectar.');
       st.tokens = await r.json(); save();
     }
-    const r = await fetch(workerBase() + '/api' + path, { headers: { Authorization: 'Bearer ' + st.tokens.access_token } });
+    return st.tokens.access_token;
+  }
+  async function stravaFetch(path) {
+    const token = await ensureStravaToken();
+    const r = await fetch(workerBase() + '/api' + path, { headers: { Authorization: 'Bearer ' + token } });
     if (r.status === 429) throw new Error('Strava limita las peticiones (100 cada 15 min). Prueba más tarde.');
     if (!r.ok) {
       // Diagnóstico: mostrar la respuesta de Strava sin exponer los tokens.
@@ -732,7 +839,7 @@
     }
     return r.json();
   }
-  async function stravaSync() {
+  async function stravaSync(auto = false) {
     if (ui.busy) return; ui.busy = true; ui.stravaMsg = ''; render();
     try {
       const imported = [], newExtras = []; let skipped = 0;
@@ -769,7 +876,7 @@
         const newest = imported[0];
         // Solo abrimos el informe automáticamente para una salida reciente; al importar
         // el histórico completo no interrumpimos con informes de entrenos antiguos.
-        if (newest.date >= R.addDays(R.today(), -14) && newest.date <= R.today()) {
+        if (!auto && newest.date >= R.addDays(R.today(), -14) && newest.date <= R.today()) {
           ui.tab = 'home'; ui.modal = { type: 'run', id: newest.id };
         }
       }
@@ -777,6 +884,33 @@
     } catch (e) { ui.stravaMsg = 'Error: ' + e.message; }
     ui.busy = false; render();
   }
+
+  /* El modelo recibe solo un resumen de rendimiento, no credenciales ni GPS.
+     La identidad del corredor se comprueba en el Worker antes de ejecutar IA. */
+  async function generativeCoach(text) {
+    const token = await ensureStravaToken();
+    const history = S.chat.slice(0,-1).slice(-8).filter(m => m.who === 'u' || m.who === 'c')
+      .map(m => ({ role: m.who === 'u' ? 'user' : 'assistant', text: String(m.text || '').slice(0, 500) }));
+    const response = await fetch(workerBase() + '/coach', {
+      method: 'POST', headers: { 'Content-Type':'application/json', Authorization: 'Bearer ' + token },
+      body: JSON.stringify({ message:text.slice(0,700), context:coachDataContext(), history }),
+    });
+    let result = {};
+    try { result = await response.json(); } catch (_) { throw new Error('El Worker no devolvió JSON. Revisa la publicación.'); }
+    if (!response.ok) throw new Error(result.error || ('El Worker respondió ' + response.status));
+    if (!result.reply || typeof result.reply !== 'string') throw new Error('No se recibió respuesta del modelo.');
+    return result.reply.slice(0,4000);
+  }
+  async function maybeAutoSync() {
+    const st = S.strava;
+    if (!st.worker || !st.tokens || ui.busy || !navigator.onLine || document.visibilityState === 'hidden') return;
+    const now = Date.now();
+    if (now - (Date.parse(st.lastSync) || 0) < 15 * 60000) return;
+    if (now - (Date.parse(st.lastAutoAttempt) || 0) < 30 * 60000) return;
+    st.lastAutoAttempt = new Date(now).toISOString(); save();
+    await stravaSync(true); // en primer plano, sin interrumpir con el informe de cada importación
+  }
+
   function parsePack(txt) {
     const m = /strava=([A-Za-z0-9_\-%]+)/.exec(txt), raw = decodeURIComponent((m ? m[1] : txt).trim());
     const t = JSON.parse(atob(raw.replace(/-/g, '+').replace(/_/g, '/')));
@@ -895,12 +1029,28 @@
     },
     'replan-ok': () => { applyFitness(); S.profile.lastReplan = R.today(); const n = regenerate(); ui.modal = { type: 'msg', title: 'Plan replanificado', body: fitNow().note + '\n\n' + (n.join('\n\n') || 'Sesiones futuras regeneradas; las que creaste tú se mantienen.') }; },
     'replan-no': () => { S.profile.lastReplan = R.today(); save(); },
-    'chat-send': () => {
-      const inp = $('#chatIn'), text = inp.value.trim(); if (!text) return;
-      S.chat.push({ who: 'u', text });
-      const r = R.chat(text, snap());
-      S.chat.push({ who: 'c', text: r.text, proposal: r.proposal || null, state: r.proposal ? 'pending' : null });
-      S.chat = S.chat.slice(-60); save();
+    'week-report': () => { ui.modal = { type:'weekly' }; },
+    'weekly-accept': () => { if (applyWeekDecision(true)) toast('Propuesta aceptada'); },
+    'weekly-decline': () => { if (applyWeekDecision(false)) toast('Mantengo tu plan'); },
+    'chat-send': async () => {
+      if (ui.aiBusy) return;
+      const inp = $('#chatIn'), text = (inp?.value || '').trim().slice(0,700); if (!text) return;
+      S.chat.push({ who: 'u', text }); save();
+      ui.aiBusy = true; render();
+      try {
+        if (S.strava.worker && S.strava.tokens) {
+          const reply = await generativeCoach(text);
+          S.chat.push({ who: 'c', text: 'IA: ' + reply });
+        } else {
+          const r = R.chat(text, snap());
+          S.chat.push({ who: 'c', text: 'Modo reglas (sin Strava): ' + r.text, proposal: r.proposal || null, state: r.proposal ? 'pending' : null });
+        }
+      } catch(e) {
+        // Fallback claro; no se finge que la IA ha respondido.
+        const r = R.chat(text, snap());
+        S.chat.push({who:'c', text: 'IA no disponible: ' + e.message + '\n\nRespuesta por reglas: ' + r.text, proposal: r.proposal || null, state:r.proposal ? 'pending' : null});
+      }
+      S.chat = S.chat.slice(-60); save(); ui.aiBusy = false; render();
     },
     'prop-ok': d => {
       const m = S.chat[+d.i], p = m.proposal, w = wkById(p.workoutId);
@@ -924,6 +1074,13 @@
       catch (e) { toast('Ese código no es válido. Cópialo entero.'); }
     },
     'strava-sync': () => { stravaSync(); },
+    'strava-athlete-id': async () => {
+      try {
+        const athlete = await stravaFetch('/athlete');
+        if (!athlete.id) throw new Error('Strava no devolvió el ID.');
+        ui.modal = {type:'msg', title:'Tu ID de atleta de Strava', body:'ID: ' + athlete.id + '\n\nEscribe ese número en la variable ALLOWED_STRAVA_ATHLETE_ID de Cloudflare para activar la IA.'};
+      } catch(e) {toast(e.message);}
+    },
     'strava-disc': () => { S.strava.tokens = null; save(); },
     regen: () => { const notes = regenerate(); ui.modal = { type: 'msg', title: 'Plan regenerado', body: notes.length ? notes.join('\n\n') : 'Listo. Las sesiones futuras pendientes se han sustituido; el histórico no cambia.' }; },
     export: () => {
@@ -989,5 +1146,8 @@
   handleMissed();
   render();
   if ('serviceWorker' in navigator && location.protocol.startsWith('http')) navigator.serviceWorker.register('sw.js').catch(() => {});
+  // Automático al abrir y al regresar a primer plano; no es sincronización en segundo plano.
+  setTimeout(maybeAutoSync, 450);
+  document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') maybeAutoSync(); });
   window.__rca = { get S() { return S; }, ui, render, R };   // para pruebas
 })();
