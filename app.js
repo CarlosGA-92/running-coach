@@ -50,7 +50,7 @@
   const snap = () => ({ workouts: S.workouts, extras: S.extras, unavailable: S.unavailable, profile: S.profile, goal: S.goal, runs: S.runs });
 
   const ui = { tab: 'home', calMode: 'week', calAnchor: R.today(), calSel: R.today(), period: 30, filter: 'all', modal: null,
-    create: { text: '', kind: 'rodajeSuave', date: R.today(), preview: null }, busy: false, aiBusy: false, intervalsBusy: false, stravaMsg: '', pseg: 'runs', cmpA: '', cmpB: '' };
+    create: { text: '', kind: 'rodajeSuave', date: R.today(), preview: null }, busy: false, aiBusy: false, intervalsBusy: false, stravaMsg: '', pseg: 'runs', cmpA: '', cmpB: '', voiceListening:false, speakReplies:localStorage.getItem('rca_voice_reply') === 'yes' };
 
   function toast(msg) { const t = $('#toast'); t.textContent = msg; t.classList.add('on'); clearTimeout(toast._t); toast._t = setTimeout(() => t.classList.remove('on'), 3200); }
 
@@ -535,6 +535,7 @@
     if (!w || w.status!=='planned') {toast('Solo puedes enviar sesiones pendientes.');return;}
     if (ui.intervalsBusy) return;
     ui.intervalsBusy=true;render();
+    let succeeded=false;
     try {
       const fingerprint=intervalsFingerprint(w);
       const result=await intervalsRequest('/intervals/workout',{
@@ -542,14 +543,14 @@
       });
       S.intervals.sent[w.id]={eventId:result.id,externalId:result.externalId,
         fingerprint,sentAt:new Date().toISOString()};
-      save();
+      save();succeeded=true;
       toast(result.structured?'Sesión enviada. Abre Companion en el iPhone.':'Enviada, pero comprueba los bloques en Intervals.icu.');
       if (!result.structured) ui.modal={type:'msg',title:'Revisa los bloques en Intervals.icu',
         body:'La API ha guardado el evento, pero no confirmó que reconociera los intervalos estructurados. Abre su calendario y comprueba que aparezcan antes de sincronizar con el reloj.'};
     } catch(e) {
       ui.modal={type:'msg',title:'No se pudo enviar a Intervals.icu',body:e.message};
     }
-    ui.intervalsBusy=false;render();
+    ui.intervalsBusy=false;render();return succeeded;
   }
   async function intervalsRemove(ids) {
     if (!Array.isArray(ids) || !ids.length || ui.intervalsBusy) return;
@@ -910,13 +911,77 @@
       ${hist.length ? hist.map(r => `<div class="item" data-act="run-open" data-id="${r.id}" style="cursor:pointer;border-bottom:1px solid var(--line)"><div class="grow"><b>${new Date(r.start).toLocaleDateString('es-ES', { weekday: 'short', day: 'numeric', month: 'short' })}</b><div class="sub small">${runLine(r)}${r.feeling ? '' : ' · sin sensaciones'}</div></div>›</div>`).join('') : '<div class="sub" style="margin-top:8px">Sin carreras.</div>'}</div>`;
   }
 
+  /* ---- Voz y comandos seguros (V9) ---- */
+  let recognition = null;
+  function speakCoach(txt) {
+    if (!ui.speakReplies || !('speechSynthesis' in window)) return;
+    try {
+      speechSynthesis.cancel();
+      const u = new SpeechSynthesisUtterance(String(txt).replace(/[*#_`]/g,'').slice(0,1700));
+      u.lang = 'es-ES'; u.rate = 1;
+      speechSynthesis.speak(u);
+    } catch (_) { toast('No se pudo reproducir la respuesta por voz'); }
+  }
+  function startVoice() {
+    const Speech = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (!Speech) {
+      toast('Este navegador no permite dictado desde la web. Usa el micrófono del teclado del iPhone.');
+      $('#chatIn')?.focus(); return;
+    }
+    if (recognition && ui.voiceListening) {recognition.stop(); return;}
+    recognition = new Speech();
+    recognition.lang='es-ES'; recognition.interimResults=false; recognition.continuous=false;
+    recognition.onresult = e => {
+      const text = Array.from(e.results).map(r => r[0]?.transcript || '').join(' ').trim();
+      const inp=$('#chatIn'); if(inp && text) {inp.value=text; ACTIONS['chat-send']();}
+    };
+    recognition.onerror = e => {
+      if (e.error !== 'no-speech' && e.error !== 'aborted') toast('No se pudo reconocer la voz: ' + e.error);
+    };
+    recognition.onend = () => {ui.voiceListening=false; recognition=null; render();};
+    try {recognition.start(); ui.voiceListening=true; render();}
+    catch (_) {ui.voiceListening=false;toast('No se ha podido iniciar el micrófono');}
+  }
+  const WEEKDAY_NAMES={lunes:1,martes:2,miercoles:3,jueves:4,viernes:5,sabado:6,domingo:0};
+  function weekdayName(t) {
+    return t.normalize('NFD').replace(/[\u0300-\u036f]/g,'').toLowerCase();
+  }
+  function plannedDay(name) {
+    const d=WEEKDAY_NAMES[name];
+    return S.workouts.filter(w=>w.status==='planned' && w.date>=R.today() && R.diffDays(R.today(),w.date)<=14 && R.weekday(w.date)===d)
+      .sort((a,b)=>a.date.localeCompare(b.date))[0];
+  }
+  function proposeCommand(raw) {
+    const t=weekdayName(raw);
+    const names=Object.keys(WEEKDAY_NAMES).join('|');
+    const move=t.match(new RegExp('(?:mueve|mover|pasa|pasar|cambia|cambiar|traslada|trasladar).*?(?:del?|de|el)\\s+('+names+')\\s+(?:al?|para|a)\\s+('+names+')'));
+    if(move){
+      const w=plannedDay(move[1]);
+      if(!w)return {text:'No encuentro una sesión pendiente para el '+move[1]+' en los próximos 14 días.'};
+      const offset=(WEEKDAY_NAMES[move[2]]-R.weekday(w.date)+7)%7 || 7;
+      const date=R.addDays(w.date,offset);
+      if(date >= S.goal.date && S.goal.kind!=='maintain')return {text:'La nueva fecha supera la fecha de tu carrera. No propongo este movimiento.'};
+      if(!R.canAutoPlace(snap(),w,date))return {text:'No puedo mover esa sesión al '+move[2]+': hay otra actividad o no respeta la recuperación. No he modificado nada.'};
+      return {text:`Puedo mover «${w.title}» del ${w.date} al ${date}. No cambiaré los demás entrenamientos sin revisarlos. ¿Lo confirmas?`,action:{kind:'move',workoutId:w.id,from:w.date,to:date}};
+    }
+    const send=t.match(new RegExp('(?:envia|enviar|manda|mandar|prepara|preparar).*?(?:entrenamiento|sesion).*?(?:('+names+')).*?(?:reloj|apple watch)|(?:envia|enviar|manda|mandar|prepara|preparar).*?(?:reloj|apple watch).*?('+names+')'));
+    if(send){
+      const name=send[1]||send[2],w=plannedDay(name);
+      if(!w)return {text:'No hay entrenamiento pendiente para el '+name+' en los próximos 14 días.'};
+      return {text:`¿Quieres enviar «${w.title}» del ${w.date} a Intervals.icu para sincronizarlo con el Apple Watch?`,action:{kind:'watch',workoutId:w.id,date:w.date}};
+    }
+    return null;
+  }
+
   /* ---- Coach ---- */
   function vCoach() {
     const msgs = S.chat.length ? S.chat : [{ who: 'c', text: 'Soy tu coach. Puedo ayudarte a interpretar las salidas y el calendario. Si la IA no está configurada, seguiré respondiendo con reglas. Nunca aplicaré una propuesta de chat sin tu permiso.' }];
     return `<h1>Coach</h1><div class="sub small" style="margin:-8px 2px 8px">IA generativa con Cloudflare Workers AI cuando está configurada; si no, coach por reglas. Se envían solo métricas y sesiones resumidas, nunca claves, GPS ni tokens al modelo. La IA no modifica el calendario por sí sola.</div>
-    ${msgs.map((m, i) => `<div class="msg ${m.who}">${esc(m.text)}</div>${m.proposal ? `<div class="prop"><div class="sub small">Propuesta</div><b>${esc(m.proposal.title)}</b>${m.state === 'ok' ? '<div class="good" style="margin-top:6px">✔ Aplicada al calendario</div>' : m.state === 'no' ? '<div class="sub" style="margin-top:6px">Descartada; el plan no ha cambiado</div>' : `<div class="btns"><button class="primary" data-act="prop-ok" data-i="${i}">Aceptar</button><button data-act="prop-no" data-i="${i}">Rechazar</button></div>`}</div>` : ''}`).join('')}
+    ${msgs.map((m, i) => `<div class="msg ${m.who}">${esc(m.text)}</div>${m.action ? `<div class="prop"><b>${m.state==='ok'?'Acción confirmada':m.state==='no'?'Acción cancelada':'Acción pendiente de confirmación'}</b>${m.state==='pending'?`<div class="btns"><button class="primary" data-act="voice-action-ok" data-i="${i}">Confirmar acción</button><button data-act="voice-action-no" data-i="${i}">Cancelar</button></div>`:''}</div>` : ''}${m.proposal ? `<div class="prop"><div class="sub small">Propuesta</div><b>${esc(m.proposal.title)}</b>${m.state === 'ok' ? '<div class="good" style="margin-top:6px">✔ Aplicada al calendario</div>' : m.state === 'no' ? '<div class="sub" style="margin-top:6px">Descartada; el plan no ha cambiado</div>' : `<div class="btns"><button class="primary" data-act="prop-ok" data-i="${i}">Aceptar</button><button data-act="prop-no" data-i="${i}">Rechazar</button></div>`}</div>` : ''}`).join('')}
     ${ui.aiBusy ? '<div class="note">El coach está preparando una respuesta…</div>' : ''}
-    <div class="row" style="margin-top:10px"><input id="chatIn" class="grow" placeholder="Pregunta a tu coach…" enterkeyhint="send" ${ui.aiBusy?'disabled':''}><button class="primary" data-act="chat-send" ${ui.aiBusy?'disabled':''}>Enviar</button></div><div id="chatEnd"></div>`;
+    <div class="row" style="margin-top:10px;flex-wrap:wrap"><input id="chatIn" style="min-width:150px" class="grow" placeholder="Pregunta a tu coach…" enterkeyhint="send" ${ui.aiBusy?'disabled':''}><button aria-label="Dictar al coach" title="Pulsar para hablar" data-act="voice-start" ${ui.aiBusy?'disabled':''}>${ui.voiceListening?'■ Detener':'🎙️ Hablar'}</button><button class="primary" data-act="chat-send" ${ui.aiBusy?'disabled':''}>Enviar</button></div>
+    <div class="row" style="margin-top:8px"><label style="margin:0;display:flex;align-items:center;gap:8px"><input type="checkbox" id="voiceRead" ${ui.speakReplies?'checked':''}> Leer respuestas en voz alta</label><button data-act="voice-stop">Detener audio</button></div>
+    <div class="sub small" style="margin-top:8px">Micrófono disponible según navegador y permisos. Si no funciona en el iPhone, utiliza el dictado del teclado. Las acciones requieren confirmación explícita.</div><div id="chatEnd"></div>`;
   }
 
   /* ---- Ajustes ---- */
@@ -1295,10 +1360,31 @@
     'week-report': () => { ui.modal = { type:'weekly' }; },
     'weekly-accept': () => { if (applyWeekDecision(true)) toast('Propuesta aceptada'); },
     'weekly-decline': () => { if (applyWeekDecision(false)) toast('Mantengo tu plan'); },
+    'voice-start': () => startVoice(),
+    'voice-stop': () => {if('speechSynthesis' in window)speechSynthesis.cancel();},
+    'voice-action-no': d => {const m=S.chat[+d.i];if(m?.state==='pending'){m.state='no';save();toast('Acción cancelada');}},
+    'voice-action-ok': async d => {
+      const m=S.chat[+d.i];if(!m?.action || m.state!=='pending')return;
+      const a=m.action,w=wkById(a.workoutId);
+      if(!w || w.status!=='planned'){toast('La sesión ya no está pendiente');return;}
+      if(a.kind==='move'){
+        if(w.date!==a.from || !R.canAutoPlace(snap(),w,a.to)){toast('El calendario ha cambiado. Vuelve a solicitar el movimiento.');m.state='no';save();return;}
+        w.date=a.to;w.explanation='Movida tras tu confirmación en el Coach';m.state='ok';save();toast('Sesión movida y sincronizada');
+      } else if(a.kind==='watch'){
+        if(w.date!==a.date){toast('La fecha ha cambiado; vuelve a solicitar el envío');m.state='no';save();return;}
+        const sent=await intervalsSend(w.id);
+        if(sent){m.state='ok';save();}
+      }
+    },
     'chat-send': async () => {
       if (ui.aiBusy) return;
       const inp = $('#chatIn'), text = (inp?.value || '').trim().slice(0,700); if (!text) return;
       S.chat.push({ who: 'u', text }); save();
+      const command=proposeCommand(text);
+      if(command){
+        S.chat.push({who:'c',text:command.text,action:command.action||null,state:command.action?'pending':null});
+        S.chat=S.chat.slice(-60);save();speakCoach(command.text);render();return;
+      }
       ui.aiBusy = true; render();
       try {
         if (S.strava.worker && S.strava.tokens) {
@@ -1313,6 +1399,7 @@
         const r = R.chat(text, snap());
         S.chat.push({who:'c', text: 'IA no disponible: ' + e.message + '\n\nRespuesta por reglas: ' + r.text, proposal: r.proposal || null, state:r.proposal ? 'pending' : null});
       }
+      const last=S.chat[S.chat.length-1]; if(last?.who==='c')speakCoach(last.text);
       S.chat = S.chat.slice(-60); save(); ui.aiBusy = false; render();
     },
     'prop-ok': d => {
@@ -1365,6 +1452,7 @@
   });
   document.addEventListener('change', e => {
     const el = e.target;
+    if (el.id === 'voiceRead') {ui.speakReplies=el.checked;localStorage.setItem('rca_voice_reply',el.checked?'yes':'no');if(!el.checked && 'speechSynthesis' in window)speechSynthesis.cancel();render();return;}
     if (el.id === 'file') {
       if (window.RCACloud?.isLinked?.()) { toast('Desvincula la nube antes de importar una copia completa.'); return; }
       const f = el.files[0]; if (!f) return;
